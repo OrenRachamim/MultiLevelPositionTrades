@@ -32,7 +32,7 @@ from .models import (CANCELLED, CLOSED, ENTERING, HOLDING_STATES, INTRADAY, O_LO
                      W_ENTERED, W_NO_SIGNAL, W_SKIPPED, W_WATCHING, AccountSnapshot, Bar,
                      Execution, OrderRequest, OrderUpdate, round_price)
 from .notifier import Notifier
-from .strategy import STRATEGIES, Signal, macd, moving_average
+from .strategy import STRATEGIES, Rejected, Signal, macd, moving_average
 from .watchlist import PARAM_COLS, parse_watchlist
 
 log = logging.getLogger("mlpt.engine")
@@ -57,6 +57,7 @@ class Engine:
     EXIT_LIMIT_TIMEOUT_SEC = 60
     EXIT_LIMIT_DISCOUNT_PCT = 0.5
     WINDOW_GRACE_SEC = 90
+    LIVE_BAR_GRACE_SEC = 4       # a minute is closed this long after it ends, next bar or not
     MISMATCH_ALERT_SEC = 30
     TIME_EXIT_BEFORE_CLOSE_SEC = 600
     SERIES_MAX = 4000
@@ -76,6 +77,7 @@ class Engine:
         self.last: dict[str, float] = {}           # last traded price per symbol
         self.subscribed: set[str] = set()
         self._once_at: dict[str, float] = {}
+        self._evaluated: dict[str, int] = {}       # ts of the last bar the strategy has seen, per symbol
         self._mismatch_since: dict[int, float] = {}
         self._sell_notices: list[tuple[float, int]] = []
         self._need_resync = True
@@ -174,11 +176,29 @@ class Engine:
         live = self.live.get(symbol)
         if live is not None and live.ts <= bar.ts:
             del self.live[symbol]
+        self._bar_done(symbol, bar)
+
+    def _bar_done(self, symbol: str, bar: Bar) -> None:
+        """Store a finished bar and let the strategy look at it - once per bar."""
         self._load_series(symbol)
         self._merge(symbol, bar)
         self.store.save_bar(symbol, bar)
-        if self.now() - (bar.ts + 60) <= self.settings.max_signal_age_sec:
-            self._evaluate_entry(symbol, bar)
+        if bar.ts <= self._evaluated.get(symbol, 0):
+            return                      # already acted on when the clock closed the minute
+        self._evaluated[symbol] = bar.ts
+        self._evaluate_entry(symbol, bar, late=self.now() - (bar.ts + 60))
+
+    def _close_live_bars(self) -> None:
+        """Close in-progress bars by the clock.
+
+        The broker only reports a bar as finished when the next one starts. In a
+        minute without trades there is no next bar, so the signal would arrive a
+        minute or more late. The minute is over when the clock says so.
+        """
+        now = self.now()
+        for symbol, bar in list(self.live.items()):
+            if now >= bar.ts + 60 + self.LIVE_BAR_GRACE_SEC and bar.ts > self._evaluated.get(symbol, 0):
+                self._bar_done(symbol, Bar(bar.ts, bar.open, bar.high, bar.low, bar.close, bar.volume, bar.rth))
 
     # ------------------------------------------------------------------ entry
     def _strategy_bars(self, symbol: str) -> list[Bar]:
@@ -187,7 +207,7 @@ class Engine:
             s = [b for b in s if b.rth]
         return s[-600:]
 
-    def _evaluate_entry(self, symbol: str, bar: Bar) -> None:
+    def _evaluate_entry(self, symbol: str, bar: Bar, late: float = 0.0) -> None:
         st = self.settings
         now_et = self.now_et()
         today = now_et.date()
@@ -203,7 +223,14 @@ class Engine:
         if not bar.rth and not st.use_extended_bars:
             return
         sig = STRATEGIES[st.strategy](self._strategy_bars(symbol), st)
-        if sig is not None:
+        hhmm = bar_et.strftime("%H:%M")
+        if isinstance(sig, Rejected):
+            self.event("INFO", "SIGNAL", f"נר {hhmm}: אין כניסה - {sig.reason}", symbol)
+        elif isinstance(sig, Signal):
+            if late > st.max_signal_age_sec:
+                self.event("WARN", "SIGNAL", f"נר {hhmm}: אות כניסה ({sig.reason}) התקבל באיחור של "
+                                             f"{late:.0f} שניות - לא בוצעה כניסה", symbol)
+                return
             self._try_enter(item, sig, sess, now_et)
 
     def params_for(self, item: dict[str, Any]) -> dict[str, Any]:
@@ -667,6 +694,8 @@ class Engine:
                 if pos is None or pos["state"] in (CLOSED, CANCELLED):
                     self._cancel(o)
 
+        self._close_live_bars()
+
         # 7. deferred sell notifications
         due = [n for n in self._sell_notices if n[0] <= now]
         self._sell_notices = [n for n in self._sell_notices if n[0] > now]
@@ -885,6 +914,51 @@ class Engine:
         else:
             rows = self.store.pos_closed(500)
         return [self.position_view(p) for p in rows]
+
+    def explain(self, symbol: str, trade_date: str) -> dict[str, Any]:
+        """Why was (or wasn't) there an entry? Re-runs the strategy over the stored bars.
+
+        Every bar on which the strategy's trigger fired is listed with the
+        verdict of the rules, next to what the system actually did that day.
+        """
+        st = self.settings
+        day = dt.date.fromisoformat(trade_date)
+        start = int(dt.datetime.combine(day, dt.time(0), tzinfo=ET).timestamp())
+        end = int(dt.datetime.combine(day + dt.timedelta(days=1), dt.time(0), tzinfo=ET).timestamp())
+        src = [b for b in self.store.bars(symbol, start - 6 * 86400, end) if b.rth or st.use_extended_bars]
+        w_start, w_end = self._at(day, st.entry_start), self._at(day, st.entry_end)
+        strategy = STRATEGIES[st.strategy]
+        crosses = []
+        for i, b in enumerate(src):
+            if b.ts < start:
+                continue
+            decision = strategy(src[max(0, i - 599):i + 1], st)
+            if decision is None:
+                continue
+            bar_et = to_et(b.ts)
+            in_window = w_start <= bar_et < w_end
+            if isinstance(decision, Rejected):
+                ok, text = False, decision.reason
+            elif not in_window:
+                ok, text = False, f"מחוץ לחלון הכניסה ({decision.reason})"
+            else:
+                ok, text = True, decision.reason
+            crosses.append({"time": b.ts + int(bar_et.utcoffset().total_seconds()),   # type: ignore[union-attr]
+                            "hhmm": bar_et.strftime("%H:%M"), "ok": ok, "in_window": in_window,
+                            "text": text, "close": b.close})
+        item = self.store.watch_find(trade_date, symbol)
+        positions = [p for p in self.store.pos_for_date(trade_date) if p["symbol"] == symbol]
+        return {
+            "symbol": symbol, "date": trade_date, "strategy": st.strategy,
+            "window": [st.entry_start, st.entry_end],
+            "bars_today": sum(1 for b in src if b.ts >= start),
+            "watch": {"status": item["status"], "note": item["note"]} if item else None,
+            "position": ({"entry_time": positions[0]["entry_time"], "entry_price": positions[0]["entry_price"],
+                          "qty": positions[0]["qty"], "state": positions[0]["state"]} if positions else None),
+            "crosses": crosses,
+            "events": [{"ts": e["ts"], "level": e["level"], "kind": e["kind"], "message": e["message"]}
+                       for e in self.store.events_between(symbol, start, end)],
+        }
 
     def chart(self, symbol: str, trade_date: str) -> dict[str, Any]:
         """Bars, moving averages, MACD and trade markers of one stock for one ET date."""

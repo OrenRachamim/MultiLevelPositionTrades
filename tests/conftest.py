@@ -16,7 +16,7 @@ from mlpt.engine import Engine  # noqa: E402
 from mlpt.market_calendar import ET, MarketCalendar  # noqa: E402
 from mlpt.models import Bar  # noqa: E402
 from mlpt.notifier import Notifier  # noqa: E402
-from mlpt.strategy import Signal  # noqa: E402
+from mlpt.strategy import Rejected, Signal  # noqa: E402
 
 D1 = dt.date(2026, 11, 10)   # Tuesday
 D2 = dt.date(2026, 11, 11)   # Wednesday
@@ -24,8 +24,12 @@ D3 = dt.date(2026, 11, 12)
 
 
 def _flag(bars, settings):
-    """Test strategy: a bar with volume 777 is an entry signal."""
-    return Signal(bars[-1].close, "test") if bars and bars[-1].volume == 777 else None
+    """Test strategy: volume 777 is an entry signal, volume 555 a trigger that a rule rejects."""
+    if bars and bars[-1].volume == 777:
+        return Signal(bars[-1].close, "test")
+    if bars and bars[-1].volume == 555:
+        return Rejected("test rule")
+    return None
 
 
 strategy.STRATEGIES["flag"] = _flag

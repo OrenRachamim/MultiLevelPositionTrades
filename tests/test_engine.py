@@ -332,3 +332,62 @@ def test_chart_payload(rig: Rig):
     assert c["bars"][0]["time"] % 86400 == 9 * 3600 + 35 * 60
     assert rig.engine.status()["realized_today"] == 49.5
     assert rig.engine.chart("AAPL", D3.isoformat())["bars"] == []
+
+
+# ------------------------------------------------------------- bar timing / "why"
+def live(rig: Rig, t: int, price: float, volume: float = 777) -> None:
+    """A broker update of the minute that is still forming."""
+    from mlpt.models import Bar
+    rig.engine.on_bar("AAPL", Bar(t, price, price, price, price, volume), False)
+
+
+def test_minute_is_closed_by_the_clock_without_waiting_for_the_next_bar(rig: Rig):
+    from mlpt.models import Bar
+    rig.load("symbol\nAAPL")
+    t = ts(D1, 9, 45)
+    rig.sim.advance(t + 30)
+    live(rig, t, 100.0)
+    rig.sim.advance(t + 62)
+    rig.engine.tick()
+    assert rig.positions() == []                                   # minute just ended: wait for late prints
+    rig.sim.advance(t + 65)
+    rig.engine.tick()
+    assert [p["state"] for p in rig.positions()] == ["ENTERING"]   # no trade in 9:46 needed
+    assert rig.working()[0]["limit_price"] == 100.1
+    # the broker reports the same bar as finished two quiet minutes later: nothing happens twice
+    rig.sim.advance(t + 185)
+    rig.engine.on_bar("AAPL", Bar(t, 100.0, 100.0, 100.0, 100.0, 777), True)
+    rig.engine.tick()
+    assert len(rig.positions()) == 1
+    assert len(rig.store.bars("AAPL")) == 1
+
+
+def test_signal_that_arrives_late_is_reported_not_traded(rig: Rig):
+    from mlpt.models import Bar
+    rig.load("symbol\nAAPL")
+    t = ts(D1, 9, 45)
+    rig.sim.advance(t + 60 + 120)                                  # the bar shows up two minutes late
+    rig.engine.on_bar("AAPL", Bar(t, 100.0, 100.0, 100.0, 100.0, 777), True)
+    assert rig.positions() == []
+    assert any("באיחור של 120 שניות" in m for m in rig.events("SIGNAL"))
+    assert rig.store.watch_for_date(D1.isoformat())[0]["status"] == W_WATCHING
+
+
+def test_explain_lists_every_trigger_with_its_verdict(rig: Rig):
+    from mlpt.models import Bar
+    rig.load("symbol\nAAPL")
+    rig.step(ts(D1, 9, 31), "AAPL", 100.0)
+    rig.sim.feed(ts(D1, 9, 40), {"AAPL": Bar(ts(D1, 9, 40), 100, 100, 100, 100, 555)})    # blocked by a rule
+    rig.engine.tick()
+    assert any("נר 09:40: אין כניסה - test rule" in m for m in rig.events("SIGNAL"))
+    t = enter(rig, at=(9, 45))
+    rig.step(t, "AAPL", 100.6)                                     # take-profit
+    rig.step(ts(D1, 11, 0), "AAPL", 100.0, signal=True)            # a trigger after the window
+    w = rig.engine.explain("AAPL", D1.isoformat())
+    assert [(x["hhmm"], x["ok"], x["in_window"]) for x in w["crosses"]] == \
+        [("09:40", False, True), ("09:45", True, True), ("11:00", False, False)]
+    assert w["crosses"][0]["text"] == "test rule" and "מחוץ לחלון" in w["crosses"][2]["text"]
+    assert w["watch"]["status"] == W_ENTERED and w["position"]["qty"] == 99 and w["window"] == ["09:30", "10:30"]
+    assert any("אות כניסה" in e["message"] for e in w["events"]) and w["bars_today"] == 6
+    empty = rig.engine.explain("MSFT", D1.isoformat())
+    assert empty["crosses"] == [] and empty["watch"] is None and empty["position"] is None

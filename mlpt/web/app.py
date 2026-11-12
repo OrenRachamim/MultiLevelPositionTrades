@@ -155,6 +155,14 @@ def create_app(engine: Engine, cfg: Config) -> FastAPI:
         except ValueError:
             raise HTTPException(400, "bad date") from None
 
+    @app.get("/api/explain")
+    def explain(symbol: str, date: str = "") -> dict[str, Any]:
+        date = date or engine.now_et().date().isoformat()
+        try:
+            return engine.explain(symbol.upper(), date)
+        except ValueError:
+            raise HTTPException(400, "bad date") from None
+
     # --- log ----------------------------------------------------------------
     @app.get("/api/events")
     def events(limit: int = 200, after_id: int = 0, symbol: str = "", level: str = "") -> dict[str, Any]:

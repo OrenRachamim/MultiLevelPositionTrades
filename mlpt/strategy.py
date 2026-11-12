@@ -1,9 +1,11 @@
 """Intraday entry strategies.
 
-A strategy is a function ``(bars, settings) -> Signal | None`` that is called
-once for every completed one-minute bar inside the entry window. ``bars`` ends
-with the bar that just closed. To add a strategy, write a function and register
-it in ``STRATEGIES``; it then becomes selectable from the dashboard settings.
+A strategy is a function ``(bars, settings) -> Signal | Rejected | None`` that
+is called once for every completed one-minute bar inside the entry window.
+``bars`` ends with the bar that just closed. ``Rejected`` means "the trigger
+happened but a rule blocked it" - it is only reported, so the dashboard can
+answer "why was there no entry at 09:45?". To add a strategy, write a function
+and register it in ``STRATEGIES``; it then becomes selectable in the settings.
 
 ``macd_cross`` is the system's intraday rule. ``ma_cross`` / ``ma_trend`` are
 simple alternatives kept for comparison in replays.
@@ -12,7 +14,7 @@ simple alternatives kept for comparison in replays.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Optional, Sequence
+from typing import Callable, Optional, Sequence, Union
 
 from .config import Settings
 from .market_calendar import to_et
@@ -23,6 +25,14 @@ from .models import Bar
 class Signal:
     price: float     # reference price for the entry (close of the signal bar)
     reason: str
+
+
+@dataclass(slots=True)
+class Rejected:
+    reason: str      # the trigger fired, and this is the rule that blocked the entry
+
+
+Decision = Union[Signal, Rejected, None]
 
 
 def sma(values: Sequence[float], n: int) -> list[Optional[float]]:
@@ -70,7 +80,7 @@ def macd(values: Sequence[float], fast: int, slow: int, signal: int
     return line, sig, hist
 
 
-def macd_cross(bars: Sequence[Bar], s: Settings) -> Optional[Signal]:
+def macd_cross(bars: Sequence[Bar], s: Settings) -> Decision:
     """Buy the first upturn after a sell-off.
 
     The price falls, the MACD line and its signal line both drop below zero,
@@ -90,9 +100,10 @@ def macd_cross(bars: Sequence[Bar], s: Settings) -> Optional[Signal]:
     m0, m1, g0, g1 = line[-2], line[-1], sig[-2], sig[-1]
     if m0 is None or m1 is None or g0 is None or g1 is None:
         return None
-    crossed_up = m0 <= g0 and m1 > g1
-    if not crossed_up or m1 >= 0 or g1 >= 0:
-        return None
+    if not (m0 <= g0 and m1 > g1):
+        return None                                 # no upward cross on this bar
+    if m1 >= 0 or g1 >= 0:
+        return Rejected(f"החיתוך מעל קו האפס (MACD {m1:.3f}, Signal {g1:.3f})")
     today = to_et(bars[-1].ts).date()
     low, before_today = m1, None
     for i in range(len(bars) - 1, -1, -1):          # walk back over the below-zero stretch
@@ -104,10 +115,10 @@ def macd_cross(bars: Sequence[Bar], s: Settings) -> Optional[Signal]:
             break
         low = min(low, v)
     if before_today is not None and low >= before_today:
-        return None                                 # the line did not fall today
+        return Rejected("קו ה-MACD לא ירד היום מתחת לרמתו בסוף יום המסחר הקודם")
     depth_pct = -low / closes[-1] * 100
     if depth_pct < s.macd_min_depth_pct:
-        return None
+        return Rejected(f"עומק הירידה {depth_pct:.2f}% ממחיר המניה קטן מהסף {s.macd_min_depth_pct:g}%")
     return Signal(closes[-1], f"MACD חצה מעל ה-Signal מתחת לאפס (עומק {depth_pct:.2f}%)")
 
 
@@ -140,7 +151,7 @@ def ma_trend(bars: Sequence[Bar], s: Settings) -> Optional[Signal]:
     return None
 
 
-STRATEGIES: dict[str, Callable[[Sequence[Bar], Settings], Optional[Signal]]] = {
+STRATEGIES: dict[str, Callable[[Sequence[Bar], Settings], Decision]] = {
     "macd_cross": macd_cross,
     "ma_cross": ma_cross,
     "ma_trend": ma_trend,

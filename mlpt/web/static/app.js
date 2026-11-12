@@ -167,6 +167,31 @@ document.addEventListener("click", async (e) => {
 let chart = null, candles = null, maFast = null, maSlow = null, priceLines = [], chartKey = "", lastChart = null;
 let macdChart = null, macdHist = null, macdLine = null, macdSignal = null;
 let chartSeq = 0, chartHadData = false, syncPaused = false;
+let whyKey = "", whyAge = 0, whyData = null;
+
+// "Why was / wasn't there an entry": every trigger of the strategy that day with the verdict of the rules.
+async function loadWhy(symbol, date, force) {
+  const key = `${symbol}|${date}`;
+  if (!force && key === whyKey && ++whyAge < 8) return;      // recomputed on demand, not on every refresh
+  whyKey = key; whyAge = 0;
+  const w = await api(`/api/explain?symbol=${encodeURIComponent(symbol)}&date=${date}`);
+  if (key !== whyKey) return;
+  whyData = w;
+  $("#why-title").textContent = `${w.symbol} · ${w.date}`;
+  const [label, c] = w.watch ? (WSTATUS[w.watch.status] || [w.watch.status, ""]) : ["לא ברשימה של אותו יום", "off"];
+  const p = w.position;
+  $("#why-status").innerHTML = `<span class="badge ${c}">${esc(label)}</span> ${esc(w.watch ? w.watch.note : "")}`
+    + (p && p.entry_time ? ` · <b>בוצעה כניסה</b> <span class="num">${nyTime(p.entry_time).slice(6, 11)}</span>, ${p.qty} מניות במחיר <span class="num">${usd(p.entry_price)}</span>` : "")
+    + ` · אסטרטגיה <span class="num">${esc(w.strategy)}</span> · חלון כניסה <span class="num">${esc(w.window[0])}–${esc(w.window[1])}</span> · ${w.bars_today} נרות בחישוב`;
+  table($("#why-crosses"), [{ t: "נר (ניו יורק)", num: 1 }, { t: "מחיר סגירה", num: 1 }, { t: "תוצאה" }, { t: "הסבר" }],
+    w.crosses.map((x) => `<tr><td class="num">${esc(x.hhmm)}</td><td class="num">${usd(x.close)}</td>
+      <td><span class="badge ${x.ok ? "on" : x.in_window ? "warn" : "off"}">${x.ok ? "אות כניסה" : "אין כניסה"}</span></td>
+      <td class="wrap">${esc(x.text)}</td></tr>`),
+    w.bars_today ? "האסטרטגיה לא זיהתה אף חיתוך בנרות של אותו יום" : "אין נרות לחישוב באותו יום");
+  table($("#why-events"), [{ t: "זמן (ניו יורק)", num: 1 }, { t: "סוג" }, { t: "הודעה" }],
+    w.events.map((e) => `<tr class="lvl-${esc(e.level)}"><td class="num">${nyTime(e.ts)}</td><td>${esc(e.kind)}</td><td class="wrap">${esc(e.message)}</td></tr>`),
+    "אין רישומים בלוג למניה ביום הזה – המערכת לא ראתה בה אות בזמן אמת");
+}
 
 // Fit both panes to the data on screen. Dragging a price axis switches the chart
 // library to a manual scale, which would otherwise survive a change of stock and
@@ -299,8 +324,15 @@ async function loadCharts() {
   candles.setMarkers(marks.map((m) => m.kind === "entry"
     ? { time: m.time, position: "belowBar", shape: "arrowUp", color: cssVar("--accent"), text: m.text }
     : { time: m.time, position: "aboveBar", shape: "arrowDown", color: m.win ? cssVar("--up") : cssVar("--down"), text: m.text }));
-  macdLine.setMarkers(marks.filter((m) => m.kind === "entry" && byTime.get(m.time).macd != null)
-    .map((m) => ({ time: m.time, position: "belowBar", shape: "arrowUp", color: cssVar("--accent"), text: "BUY" })));
+  await loadWhy(d.symbol, d.date, `${d.symbol}|${d.date}` !== whyKey).catch(() => {});
+  if (seq !== chartSeq) return;
+  // MACD pane: the buy, and every trigger of the strategy inside the entry window (accepted or not)
+  const buys = marks.filter((m) => m.kind === "entry" && byTime.get(m.time).macd != null)
+    .map((m) => ({ time: m.time, position: "belowBar", shape: "arrowUp", color: cssVar("--accent"), text: "BUY" }));
+  const crosses = (whyData && whyKey === `${d.symbol}|${d.date}` ? whyData.crosses : [])
+    .filter((x) => x.in_window && byTime.has(x.time) && byTime.get(x.time).macd != null && !buys.some((b) => b.time === x.time))
+    .map((x) => ({ time: x.time, position: "aboveBar", shape: "circle", color: x.ok ? cssVar("--up") : cssVar("--muted"), text: x.ok ? "✓" : "✕" }));
+  macdLine.setMarkers([...buys, ...crosses].sort((a, b) => a.time - b.time));
   priceLines.forEach((l) => candles.removePriceLine(l));
   const style = { entry: ["כניסה", cssVar("--accent")], tp: ["TP", cssVar("--up")], sl: ["SL", cssVar("--down")] };
   priceLines = d.levels.filter((l) => l.price).map((l) => candles.createPriceLine({

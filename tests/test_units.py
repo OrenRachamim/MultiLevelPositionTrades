@@ -9,7 +9,7 @@ from mlpt.broker.sim import SimBroker
 from mlpt.config import Config, Settings
 from mlpt.market_calendar import MarketCalendar
 from mlpt.models import (O_CANCELLED, O_FILLED, O_REJECTED, Bar, OrderRequest, round_price)
-from mlpt.strategy import ema, ma_cross, ma_trend, macd, macd_cross, sma
+from mlpt.strategy import Rejected, Signal, ema, ma_cross, ma_trend, macd, macd_cross, sma
 from mlpt.watchlist import parse_watchlist
 
 
@@ -117,7 +117,7 @@ def macd_fires(today_closes, prev_closes=None, **settings):
     s = Settings(**settings)
     prev = day_bars(dt.date(2026, 11, 9), prev_closes or [100.0] * 90)
     today = day_bars(D1, today_closes)
-    return [i for i in range(len(today)) if macd_cross(prev + today[:i + 1], s)]
+    return [i for i in range(len(today)) if isinstance(macd_cross(prev + today[:i + 1], s), Signal)]
 
 
 def test_macd_cross_buys_the_first_upturn_after_a_selloff():
@@ -145,6 +145,29 @@ def test_macd_cross_ignores_shallow_dips_and_crosses_above_zero():
     ups = [i for i in range(91, len(line)) if line[i - 1] <= sig[i - 1] and line[i] > sig[i]]
     assert ups and all(line[i] > 0 for i in ups)                       # the data really has such a cross
     assert macd_fires(rally, macd_min_depth_pct=0.0) == []
+
+
+def macd_rejections(today_closes, prev_closes=None, **settings):
+    s = Settings(**settings)
+    prev = day_bars(dt.date(2026, 11, 9), prev_closes or [100.0] * 90)
+    today = day_bars(D1, today_closes)
+    out = [macd_cross(prev + today[:i + 1], s) for i in range(len(today))]
+    return [r.reason for r in out if isinstance(r, Rejected)]
+
+
+def test_macd_cross_says_why_a_cross_was_not_a_signal():
+    shallow = [100 - 0.004 * i for i in range(1, 11)] + [99.96 + 0.01 * i for i in range(1, 30)]
+    reasons = macd_rejections(shallow)
+    assert len(reasons) == 1 and "עומק" in reasons[0] and "0.1%" in reasons[0]
+    rally = [100 + 0.1 * i for i in range(1, 31)] + [103 - 0.05 * i for i in range(1, 6)] + \
+            [102.75 + 0.1 * i for i in range(1, 20)]
+    assert any("מעל קו האפס" in r for r in macd_rejections(rally))
+    prev = [100.0] * 60 + [100 - 0.08 * i for i in range(1, 31)]
+    recover = [prev[-1] + 0.05 * i for i in range(1, 40)]
+    assert any("יום המסחר הקודם" in r for r in macd_rejections(recover, prev_closes=prev))
+    down_up = [100 - 0.08 * i for i in range(1, 17)]
+    down_up += [down_up[-1] + 0.06 * i for i in range(1, 30)]
+    assert macd_rejections(down_up) == []                               # a clean signal: nothing rejected
 
 
 def test_macd_cross_needs_the_selloff_to_happen_today():

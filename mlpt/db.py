@@ -269,6 +269,10 @@ class Store:
         return self._insert("events", {"ts": ts, "level": level, "kind": kind,
                                        "symbol": symbol, "message": message})
 
+    def events_between(self, symbol: str, start_ts: int, end_ts: int, limit: int = 300) -> list[dict[str, Any]]:
+        return self._all("SELECT * FROM events WHERE symbol = ? AND ts >= ? AND ts < ? ORDER BY id LIMIT ?",
+                         (symbol, start_ts, end_ts, limit))
+
     def events(self, limit: int = 200, after_id: int = 0, symbol: str = "",
                level: str = "") -> list[dict[str, Any]]:
         sql, args = "SELECT * FROM events WHERE id > ?", [after_id]
