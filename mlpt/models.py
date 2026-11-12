@@ -24,6 +24,8 @@ W_SKIPPED = "SKIPPED"
 ROLE_ENTRY = "ENTRY"
 ROLE_TP = "TP"
 ROLE_SL = "SL"
+ROLE_TRAIL = "TRAIL"     # trailing stop that replaces the stop once the intraday target is reached
+PROTECTIVE_ROLES = (ROLE_TP, ROLE_SL, ROLE_TRAIL)
 ROLE_EXIT = "EXIT"       # manual / time based exit
 
 O_SUBMITTED = "SUBMITTED"
@@ -37,6 +39,7 @@ TERMINAL = (O_FILLED, O_CANCELLED, O_REJECTED, O_LOST)
 # --- exit reasons ----------------------------------------------------------
 R_TP = "TP"
 R_SL = "SL"
+R_TRAIL = "TRAIL"
 R_MANUAL = "MANUAL"
 R_TIME = "TIME"
 R_EXTERNAL = "EXTERNAL"
@@ -60,9 +63,10 @@ class OrderRequest:
     symbol: str
     side: str                      # BUY / SELL
     qty: int
-    type: str                      # LMT / STP / MKT
+    type: str                      # LMT / STP / MKT / TRAIL
     limit_price: Optional[float] = None
-    stop_price: Optional[float] = None
+    stop_price: Optional[float] = None     # TRAIL: the stop price the order starts with
+    trail_pct: Optional[float] = None      # TRAIL: distance below the highest price, in percent
     tif: str = "DAY"               # DAY / GTC
     outside_rth: bool = False
     oca_group: Optional[str] = None

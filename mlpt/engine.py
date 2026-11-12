@@ -28,7 +28,8 @@ from .config import Settings, parse_hhmm
 from .db import Store
 from .market_calendar import ET, MarketCalendar, Session, to_et
 from .models import (CANCELLED, CLOSED, ENTERING, HOLDING_STATES, INTRADAY, O_LOST, O_REJECTED,
-                     O_SUBMITTED, OPEN_STATES, R_EXTERNAL, R_MANUAL, R_SL, R_TIME, R_TP, ROLE_ENTRY, ROLE_EXIT, ROLE_SL, ROLE_TP, SWING, TERMINAL,
+                     O_SUBMITTED, OPEN_STATES, PROTECTIVE_ROLES, R_EXTERNAL, R_MANUAL, R_SL, R_TIME,
+                     R_TP, R_TRAIL, ROLE_ENTRY, ROLE_EXIT, ROLE_SL, ROLE_TP, ROLE_TRAIL, SWING, TERMINAL,
                      W_ENTERED, W_NO_SIGNAL, W_SKIPPED, W_WATCHING, AccountSnapshot, Bar,
                      Execution, OrderRequest, OrderUpdate, round_price)
 from .notifier import Notifier
@@ -38,7 +39,7 @@ from .watchlist import PARAM_COLS, parse_watchlist
 log = logging.getLogger("mlpt.engine")
 
 PHASE_HE = {INTRADAY: "תוך-יומי", SWING: "סווינג"}
-REASON_HE = {R_TP: "Take Profit", R_SL: "Stop Loss", R_MANUAL: "סגירה ידנית",
+REASON_HE = {R_TP: "Take Profit", R_SL: "Stop Loss", R_TRAIL: "סטופ נגרר", R_MANUAL: "סגירה ידנית",
              R_TIME: "מקסימום ימי החזקה", R_EXTERNAL: "נסגרה מחוץ למערכת"}
 
 
@@ -170,6 +171,7 @@ class Engine:
     def on_bar(self, symbol: str, bar: Bar, completed: bool) -> None:
         bar.rth = self.calendar.is_rth_ts(bar.ts)
         self.last[symbol] = bar.close
+        self._check_trail(symbol, bar)
         if not completed:
             self.live[symbol] = bar
             return
@@ -322,7 +324,7 @@ class Engine:
             ref_price=sig.price, signal=sig.reason,
             intraday_tp_pct=p["intraday_tp_pct"], intraday_sl_pct=p["intraday_sl_pct"],
             swing_tp_pct=p["swing_tp_pct"], swing_sl_pct=p["swing_sl_pct"],
-            max_hold_days=int(p["max_hold_days"] or 0))
+            max_hold_days=int(p["max_hold_days"] or 0), trail_pct=st.intraday_trail_pct)
         req = OrderRequest(symbol=sym, side="BUY", qty=qty, type="LMT", limit_price=limit, tif="DAY",
                            outside_rth=not sess.is_rth(now_et), ref=f"MLPT-{pos_id}-ENTRY")
         self.store.watch_update(item["id"], status=W_ENTERED, note=sig.reason)
@@ -352,12 +354,14 @@ class Engine:
             ids.append(self.store.order_add(
                 position_id=pos_id, symbol=req.symbol, role=role, phase=phase, reason=reason,
                 side=req.side, type=req.type, qty=req.qty, limit_price=req.limit_price,
-                stop_price=req.stop_price, tif=req.tif, outside_rth=int(req.outside_rth),
-                oca_group=req.oca_group, broker_order_id=bid, status=O_SUBMITTED))
+                stop_price=req.stop_price, trail_pct=req.trail_pct, tif=req.tif,
+                outside_rth=int(req.outside_rth), oca_group=req.oca_group, broker_order_id=bid,
+                status=O_SUBMITTED))
             price = req.limit_price if req.type == "LMT" else req.stop_price
             self.event("INFO", "ORDER",
                        f"נשלחה פקודת {role}: {req.side} {req.qty} {req.type}"
-                       f"{' ' + usd(price) if price else ''} {req.tif}"
+                       f"{' ' + usd(price) if price else ''}"
+                       f"{f' (נגרר {req.trail_pct:g}%)' if req.trail_pct else ''} {req.tif}"
                        f"{' (גם מחוץ לשעות המסחר)' if req.outside_rth else ''}", req.symbol)
         return ids
 
@@ -466,10 +470,11 @@ class Engine:
         self.store.pos_update(pos["id"], state=INTRADAY, qty=filled, qty_open=filled, entry_price=entry,
                               entry_time=int(self.now()), tp_price=tp, sl_price=sl)
         partial = f" (מילוי חלקי מתוך {o['qty']})" if filled < o["qty"] else ""
+        target = f"TP {usd(tp)}" + (f" (ואז סטופ נגרר {pos['trail_pct']:g}%)" if pos["trail_pct"] else "")
         self.event("INFO", "FILL", f"קנייה: {filled} מניות במחיר {usd(entry)}{partial} · "
-                                   f"TP {usd(tp)} · SL {usd(sl)}", sym)
+                                   f"{target} · SL {usd(sl)}", sym)
         self.notifier.notify(f"🟢 קנייה {sym} · תוך-יומי\n{filled} מניות × {usd(entry)} = {usd(filled * entry)}\n"
-                             f"TP {usd(tp)} · SL {usd(sl)}")
+                             f"{target} · SL {usd(sl)}")
         self._manage(self.store.pos_get(pos["id"]))   # type: ignore[arg-type]
 
     @staticmethod
@@ -493,8 +498,8 @@ class Engine:
             # the fill price is unknown when the order completed while we were offline
             return x["avg_price"] or x["limit_price"] or x["stop_price"] or self.last.get(pos["symbol"], 0.0)
 
-        exit_price = sum(int(x["filled"]) * price(x) for x in exits) / sold if sold else price(o)
-        reason = {ROLE_TP: R_TP, ROLE_SL: R_SL}.get(o["role"], o["reason"] or R_MANUAL)
+        exit_price = round(sum(int(x["filled"]) * price(x) for x in exits) / sold if sold else price(o), 4)
+        reason = {ROLE_TP: R_TP, ROLE_SL: R_SL, ROLE_TRAIL: R_TRAIL}.get(o["role"], o["reason"] or R_MANUAL)
         self._close(pos, exit_price, reason, o["phase"] or pos["state"])
 
     def _close(self, pos: dict[str, Any], exit_price: float, reason: str, phase: str) -> None:
@@ -538,6 +543,37 @@ class Engine:
         self.notifier.notify(f"🔄 {pos['symbol']} עברה לסווינג\nTP {usd(tp)} · SL {usd(sl)}")
         return self.store.pos_get(pos["id"])   # type: ignore[return-value]
 
+    @staticmethod
+    def _wanted(pos: dict[str, Any]) -> dict[str, float]:
+        """The protective orders a position should have right now: role -> price."""
+        if pos["state"] == INTRADAY and pos["trail_pct"]:
+            # trailing mode: no take-profit order. The stop guards the position until the
+            # target is reached, then a trailing stop takes its place.
+            if pos["trail_active"]:
+                return {ROLE_TRAIL: pos["trail_stop"]}
+            return {ROLE_SL: pos["sl_price"]}
+        return {ROLE_TP: pos["tp_price"], ROLE_SL: pos["sl_price"]}
+
+    def _check_trail(self, symbol: str, bar: Bar) -> None:
+        """Intraday target reached -> arm the trailing stop instead of selling."""
+        if not bar.rth:
+            return                                  # stops (and so the trailing stop) only work in regular hours
+        for pos in self.store.pos_in_states((INTRADAY,)):
+            if (pos["symbol"] != symbol or not pos["trail_pct"] or pos["trail_active"]
+                    or pos["exit_request"] or bar.ts + 60 <= pos["entry_time"]):
+                continue
+            # a bar that began before the fill may have made its high before we owned the shares
+            price = bar.high if bar.ts >= pos["entry_time"] else bar.close
+            if price < pos["tp_price"]:
+                continue
+            stop = round_price(price * (1 - pos["trail_pct"] / 100))
+            self.store.pos_update(pos["id"], trail_active=1, trail_stop=stop, trail_time=int(self.now()))
+            self.event("INFO", "POSITION", f"המחיר הגיע ליעד {usd(pos['tp_price'])} - מופעל סטופ נגרר "
+                                           f"{pos['trail_pct']:g}%, סטופ התחלתי {usd(stop)}", symbol)
+            self.notifier.notify(f"🎯 {symbol} הגיעה ליעד {usd(pos['tp_price'])}\n"
+                                 f"סטופ נגרר {pos['trail_pct']:g}% · התחלתי {usd(stop)}")
+            self._manage(self.store.pos_get(pos["id"]))   # type: ignore[arg-type]
+
     def _manage(self, pos: dict[str, Any]) -> None:
         """Make the broker's working exit orders match what the position needs."""
         if pos["state"] not in HOLDING_STATES or pos["qty_open"] <= 0 or pos["halted"]:
@@ -551,7 +587,7 @@ class Engine:
         working = [o for o in self.store.orders_for_position(pos["id"])
                    if o["status"] == O_SUBMITTED and o["role"] != ROLE_ENTRY]
         exits = [o for o in working if o["role"] == ROLE_EXIT]
-        prot = [o for o in working if o["role"] in (ROLE_TP, ROLE_SL)]
+        prot = [o for o in working if o["role"] in PROTECTIVE_ROLES]
 
         if pos["exit_request"]:
             for o in exits:
@@ -566,15 +602,16 @@ class Engine:
             self._place_exit(pos, now_et)
             return
 
-        want = {ROLE_TP: pos["tp_price"], ROLE_SL: pos["sl_price"]}
+        want = self._wanted(pos)
 
         def matches(o: dict[str, Any]) -> bool:
             price = o["limit_price"] if o["role"] == ROLE_TP else o["stop_price"]
-            return (o["phase"] == pos["state"] and abs(price - want[o["role"]]) < 1e-6
+            return (o["role"] in want and o["phase"] == pos["state"]
+                    and abs(price - want[o["role"]]) < 1e-6
                     and o["qty"] - int(o["filled"]) == pos["qty_open"])
 
         roles = [o["role"] for o in prot]
-        if all(matches(o) for o in prot) and sorted(roles) == [ROLE_SL, ROLE_TP]:
+        if all(matches(o) for o in prot) and sorted(roles) == sorted(want):
             self._mismatch_since.pop(pos["id"], None)
             return                                     # fully protected
         if prot:                                       # wrong, partial or duplicated: rebuild
@@ -610,12 +647,23 @@ class Engine:
             return
         phase, qty = pos["state"], pos["qty_open"]
         n = pos["exit_placements"] + 1
-        oca = f"MLPT-{pos['id']}-{phase}-{n}"
-        tp = OrderRequest(symbol=sym, side="SELL", qty=qty, type="LMT", limit_price=pos["tp_price"],
-                          tif="GTC", outside_rth=st.tp_outside_rth, oca_group=oca, ref=f"{oca}-TP")
-        sl = OrderRequest(symbol=sym, side="SELL", qty=qty, type="STP", stop_price=pos["sl_price"],
-                          tif="GTC", outside_rth=st.sl_outside_rth, oca_group=oca, ref=f"{oca}-SL")
-        if self._submit_group(pos["id"], [(tp, ROLE_TP), (sl, ROLE_SL)], phase) is not None:
+        want = self._wanted(pos)
+        group = f"MLPT-{pos['id']}-{phase}-{n}"
+        oca = group if len(want) > 1 else None      # a single order needs no one-cancels-all group
+        items: list[tuple[OrderRequest, str]] = []
+        if ROLE_TP in want:
+            items.append((OrderRequest(symbol=sym, side="SELL", qty=qty, type="LMT", limit_price=want[ROLE_TP],
+                                       tif="GTC", outside_rth=st.tp_outside_rth, oca_group=oca,
+                                       ref=f"{group}-TP"), ROLE_TP))
+        if ROLE_SL in want:
+            items.append((OrderRequest(symbol=sym, side="SELL", qty=qty, type="STP", stop_price=want[ROLE_SL],
+                                       tif="GTC", outside_rth=st.sl_outside_rth, oca_group=oca,
+                                       ref=f"{group}-SL"), ROLE_SL))
+        if ROLE_TRAIL in want:
+            items.append((OrderRequest(symbol=sym, side="SELL", qty=qty, type="TRAIL", stop_price=want[ROLE_TRAIL],
+                                       trail_pct=pos["trail_pct"], tif="GTC", outside_rth=False,
+                                       ref=f"{group}-TRAIL"), ROLE_TRAIL))
+        if self._submit_group(pos["id"], items, phase) is not None:
             self.store.pos_update(pos["id"], exit_placements=n)
 
     def _place_exit(self, pos: dict[str, Any], now_et: dt.datetime) -> None:
@@ -905,8 +953,20 @@ class Engine:
             row["days_held"] = self.calendar.trading_days_between(
                 dt.date.fromisoformat(p["trade_date"]), self.now_et().date())
             working = [o for o in self.store.orders_for_position(p["id"]) if o["status"] == O_SUBMITTED]
-            row["protected"] = sorted(o["role"] for o in working if o["role"] in (ROLE_TP, ROLE_SL)) == [ROLE_SL, ROLE_TP]
+            row["protected"] = sorted(o["role"] for o in working if o["role"] in PROTECTIVE_ROLES) \
+                == sorted(self._wanted(p))
+            row["trail_stop_now"] = self._trail_stop_now(p)
         return row
+
+    def _trail_stop_now(self, p: dict[str, Any]) -> Optional[float]:
+        """Estimate of where the broker's trailing stop stands (it moves at the broker, not here)."""
+        if not (p["state"] == INTRADAY and p["trail_active"] and p["trail_stop"]):
+            return None
+        bars = [b for b in self.series.get(p["symbol"], []) if b.rth and b.ts + 60 > p["trail_time"]]
+        live = self.live.get(p["symbol"])
+        highs = [b.high for b in bars] + ([live.high] if live is not None and live.rth else [])
+        best = max(highs) * (1 - p["trail_pct"] / 100) if highs else 0.0
+        return max(p["trail_stop"], round_price(best))
 
     def positions_view(self, which: str = "open") -> list[dict[str, Any]]:
         if which == "open":
@@ -1002,9 +1062,12 @@ class Engine:
                                 "win": (p["pnl"] or 0) >= 0,
                                 "text": f"SELL {p['exit_price']:.2f} {p['exit_reason']}"})
             if p["state"] in HOLDING_STATES:
-                levels = [{"kind": "entry", "price": p["entry_price"]},
-                          {"kind": "tp", "price": p["tp_price"]},
-                          {"kind": "sl", "price": p["sl_price"]}]
+                levels = [{"kind": "entry", "price": p["entry_price"]}]
+                trail = self._trail_stop_now(p)
+                if trail is not None:
+                    levels.append({"kind": "trail", "price": trail})
+                else:
+                    levels += [{"kind": "tp", "price": p["tp_price"]}, {"kind": "sl", "price": p["sl_price"]}]
         return {
             "symbol": symbol, "date": trade_date,
             "bars": [{"time": shift(b.ts), "open": b.open, "high": b.high, "low": b.low,

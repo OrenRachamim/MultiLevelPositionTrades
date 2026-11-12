@@ -11,6 +11,10 @@ Fill model (deliberately conservative):
 * sell stop  - fills when the bar trades at or below the stop, at the stop
   price or at the open when the bar gaps below it;
 * when a bar touches both the stop and the take-profit, the stop wins;
+* trailing stop - checked against the stop it carried into the bar (gap: the
+  open), then raised to the bar's high minus the trail; it also fills at the
+  raised stop when the bar closes at or below it. With one-minute bars and a
+  trail of a few tenths of a percent this is only an approximation;
 * orders without ``outside_rth`` only work on regular-hours bars.
 """
 
@@ -36,6 +40,7 @@ class _SimOrder:
     status: str = O_SUBMITTED
     filled: float = 0.0
     avg_price: float = 0.0
+    stop: float = 0.0            # TRAIL: where the trailing stop stands now
 
 
 class SimBroker(Broker):
@@ -85,7 +90,7 @@ class SimBroker(Broker):
 
     def place(self, req: OrderRequest) -> str:
         self._seq += 1
-        o = _SimOrder(id=f"S{self._seq}", req=req, placed_at=self.time)
+        o = _SimOrder(id=f"S{self._seq}", req=req, placed_at=self.time, stop=req.stop_price or 0.0)
         self.orders[o.id] = o
         self._emit(o)
         return o.id
@@ -155,7 +160,7 @@ class SimBroker(Broker):
         live = [o for o in self.orders.values()
                 if o.status == O_SUBMITTED and o.req.symbol == symbol and o.placed_at <= bar.ts]
         # stops first: when a bar spans both levels assume the worse outcome
-        live.sort(key=lambda o: 0 if o.req.type == "STP" else 1)
+        live.sort(key=lambda o: 0 if o.req.type in ("STP", "TRAIL") else 1)
         for o in live:
             if o.status != O_SUBMITTED:      # cancelled by an OCA sibling
                 continue
@@ -171,6 +176,13 @@ class SimBroker(Broker):
                 price = max(r.limit_price, bar.open)
             elif r.type == "STP" and r.side == "SELL" and bar.low <= r.stop_price:
                 price = min(r.stop_price, bar.open)
+            elif r.type == "TRAIL" and r.side == "SELL":
+                if bar.low <= o.stop:
+                    price = min(o.stop, bar.open)
+                else:
+                    o.stop = max(o.stop, round(bar.high * (1 - r.trail_pct / 100), 2))
+                    if bar.close <= o.stop:
+                        price = o.stop
             if price is not None:
                 self._fill(o, price, bar.ts)
 

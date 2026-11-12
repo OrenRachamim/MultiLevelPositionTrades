@@ -329,6 +329,10 @@ class IBBroker(Broker):
             order.lmtPrice = req.limit_price
         elif req.type == "STP":
             order.auxPrice = req.stop_price
+        elif req.type == "TRAIL":
+            # native trailing stop: IB moves the stop itself, tick by tick
+            order.trailingPercent = req.trail_pct
+            order.trailStopPrice = req.stop_price
         if req.oca_group:
             order.ocaGroup = req.oca_group
             order.ocaType = OCA_CANCEL_WITH_BLOCK

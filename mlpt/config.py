@@ -103,6 +103,9 @@ class Settings:
 
     # default trade parameters (used when the daily list leaves a cell empty)
     intraday_tp_pct: float = 0.5
+    # 0 = sell at the intraday target. Above 0: when the price reaches the target the
+    # position is not sold; its stop becomes a trailing stop this many percent below the high.
+    intraday_trail_pct: float = 0.0
     intraday_sl_pct: float = 0.0      # 0 = use the swing stop
     swing_tp_pct: float = 5.0
     swing_sl_pct: float = 4.0
@@ -143,7 +146,8 @@ class Settings:
         if self.position_pct > 100:
             raise ValueError("position_pct must be <= 100")
         for n in ("max_position_usd", "cash_reserve_usd", "max_open_positions",
-                  "intraday_sl_pct", "max_hold_days", "entry_slippage_pct", "macd_min_depth_pct"):
+                  "intraday_sl_pct", "max_hold_days", "entry_slippage_pct", "macd_min_depth_pct",
+                  "intraday_trail_pct"):
             pos(n, allow_zero=True)
         for n in ("intraday_tp_pct", "swing_tp_pct", "swing_sl_pct",
                   "entry_timeout_sec", "max_signal_age_sec", "ma_fast", "ma_slow",
@@ -151,6 +155,8 @@ class Settings:
             pos(n)
         if self.swing_sl_pct >= 100 or self.intraday_sl_pct >= 100:
             raise ValueError("stop loss must be below 100%")
+        if self.intraday_trail_pct >= 20:
+            raise ValueError("intraday_trail_pct must be below 20%")
         if self.ma_fast >= self.ma_slow:
             raise ValueError("ma_fast must be smaller than ma_slow")
         if self.macd_fast >= self.macd_slow:

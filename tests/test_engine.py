@@ -391,3 +391,118 @@ def test_explain_lists_every_trigger_with_its_verdict(rig: Rig):
     assert any("אות כניסה" in e["message"] for e in w["events"]) and w["bars_today"] == 6
     empty = rig.engine.explain("MSFT", D1.isoformat())
     assert empty["crosses"] == [] and empty["watch"] is None and empty["position"] is None
+
+
+# ------------------------------------------------- trailing stop after the target
+def trail_rig() -> Rig:
+    rig = Rig(intraday_trail_pct=0.2)
+    rig.load("symbol\nAAPL")
+    return rig
+
+
+def test_trailing_mode_starts_with_the_stop_only():
+    rig = trail_rig()
+    t = enter(rig)
+    pos = rig.positions()[0]
+    assert pos["trail_pct"] == 0.2 and not pos["trail_active"] and pos["tp_price"] == 100.5
+    assert roles(rig) == [ROLE_SL] and rig.working()[0]["oca_group"] is None     # no take-profit order
+    assert rig.engine.position_view(pos)["protected"] is True
+    rig.step(t, "AAPL", 100.3)                                    # below the target: nothing changes
+    assert roles(rig) == [ROLE_SL] and not rig.positions()[0]["trail_active"]
+    assert any("ואז סטופ נגרר 0.2%" in m for m in rig.notifier.sent)
+
+
+def test_target_arms_a_trailing_stop_that_follows_the_price_up():
+    rig = trail_rig()
+    t = enter(rig)
+    rig.step(t, "AAPL", 100.6)                                    # trades through the 100.50 target
+    pos = rig.positions()[0]
+    assert pos["state"] == INTRADAY and pos["trail_active"] == 1 and pos["trail_stop"] == 100.4
+    order = rig.working()[0]
+    assert roles(rig) == ["TRAIL"] and (order["type"], order["stop_price"], order["trail_pct"]) == ("TRAIL", 100.4, 0.2)
+    assert order["tif"] == "GTC" and rig.engine.position_view(pos)["protected"] is True
+    assert sum(1 for o in rig.sim.orders.values() if o.status == O_SUBMITTED) == 1     # the stop was replaced
+    assert any("🎯 AAPL" in m for m in rig.notifier.sent)
+
+    rig.step(t + 60, "AAPL", 101.0)                               # new high: the stop follows to 100.80
+    assert rig.positions()[0]["state"] == INTRADAY
+    assert rig.engine.position_view(rig.positions()[0])["trail_stop_now"] == 100.8
+    assert [lv["kind"] for lv in rig.engine.chart("AAPL", D1.isoformat())["levels"]] == ["entry", "trail"]
+    rig.step(t + 120, "AAPL", 100.5)                              # falls back through it
+    pos = rig.positions()[0]
+    assert pos["state"] == CLOSED and pos["exit_reason"] == "TRAIL" and pos["exit_phase"] == INTRADAY
+    assert pos["exit_price"] == 100.8 and pos["pnl"] == 79.2      # more than the 49.50 of a plain take-profit
+    assert rig.working() == []
+    rig.step(t + 180, "AAPL", 100.5)
+    assert any("מכירה AAPL" in m and "סטופ נגרר" in m for m in rig.notifier.sent)
+
+
+def test_trailing_stop_sells_at_once_when_the_price_falls_straight_back():
+    rig = trail_rig()
+    t = enter(rig)
+    rig.step(t, "AAPL", 100.6)
+    rig.step(t + 60, "AAPL", 100.1, open_=100.2)                  # opens below the initial stop of 100.40
+    pos = rig.positions()[0]
+    assert pos["state"] == CLOSED and pos["exit_reason"] == "TRAIL" and pos["exit_price"] == 100.2
+
+
+def test_trailing_mode_keeps_the_stop_loss_until_the_target():
+    rig = trail_rig()
+    t = enter(rig)
+    rig.step(t, "AAPL", 95.0)
+    pos = rig.positions()[0]
+    assert pos["state"] == CLOSED and pos["exit_reason"] == "SL" and pos["exit_price"] == 96.0
+
+
+def test_trailing_is_not_armed_after_hours_or_by_the_fill_bar():
+    rig = Rig(intraday_trail_pct=0.2)
+    rig.load("symbol\nAAPL")
+    t = ts(D1, 9, 35)
+    rig.step(t, "AAPL", 100.0, signal=True)
+    rig.step(t + 60, "AAPL", 100.0, high=100.9)                   # the high of the fill bar may predate the fill
+    assert rig.positions()[0]["state"] == INTRADAY and not rig.positions()[0]["trail_active"]
+    rig.step(ts(D1, 17, 0), "AAPL", 100.9)                        # after hours: stops do not work there
+    assert not rig.positions()[0]["trail_active"] and roles(rig) == [ROLE_SL]
+
+
+def test_trailing_position_becomes_a_normal_swing_overnight():
+    for armed in (False, True):
+        rig = trail_rig()
+        t = enter(rig)
+        if armed:
+            rig.step(t, "AAPL", 100.6)
+            rig.step(t + 60, "AAPL", 100.55)
+            assert roles(rig) == ["TRAIL"]
+        rig.step(ts(D1, 20, 1))
+        rig.step(ts(D1, 20, 2))
+        pos = rig.positions()[0]
+        assert pos["state"] == SWING and (pos["tp_price"], pos["sl_price"]) == (105.0, 96.0)
+        assert roles(rig) == [ROLE_SL, ROLE_TP] and all(o["phase"] == SWING for o in rig.working())
+        assert sum(1 for o in rig.sim.orders.values() if o.status == O_SUBMITTED) == 2
+        rig.step(ts(D2, 10, 0), "AAPL", 105.3)                    # the swing target sells, no trailing
+        assert rig.positions()[0]["exit_reason"] == "TP"
+
+
+def test_restart_keeps_the_trailing_order():
+    rig = trail_rig()
+    t = enter(rig)
+    rig.step(t, "AAPL", 100.6)
+    before = [o["id"] for o in rig.working()]
+    rig.restart()
+    rig.step(t + 60, "AAPL", 100.7)
+    assert [o["id"] for o in rig.working()] == before
+    assert sum(1 for o in rig.sim.orders.values() if o.status == O_SUBMITTED) == 1
+    rig.step(t + 120, "AAPL", 100.2)
+    assert rig.positions()[0]["exit_reason"] == "TRAIL"
+
+
+def test_trailing_setting_applies_to_new_entries_only(rig: Rig):
+    rig.load("symbol\nAAPL\nMSFT")
+    t = enter(rig, "AAPL")
+    rig.engine.update_settings({"intraday_trail_pct": 0.3})
+    assert roles(rig) == [ROLE_SL, ROLE_TP]                       # the open position keeps its take-profit
+    rig.step(t, "MSFT", 50.0, signal=True)
+    rig.step(t + 60, "MSFT", 50.0)
+    msft = next(p for p in rig.positions() if p["symbol"] == "MSFT")
+    assert msft["trail_pct"] == 0.3
+    assert sorted(o["role"] for o in rig.working() if o["symbol"] == "MSFT") == [ROLE_SL]

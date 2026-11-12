@@ -45,6 +45,8 @@ CREATE TABLE IF NOT EXISTS positions (
     exit_price REAL, exit_time INTEGER, exit_reason TEXT, exit_phase TEXT,
     pnl REAL, pnl_pct REAL, commission REAL NOT NULL DEFAULT 0,
     exit_placements INTEGER NOT NULL DEFAULT 0,
+    trail_pct REAL NOT NULL DEFAULT 0,       -- trailing stop after the intraday target, 0 = off
+    trail_active INTEGER NOT NULL DEFAULT 0, trail_stop REAL, trail_time INTEGER,
     halted INTEGER NOT NULL DEFAULT 0,       -- automatic management stopped
     created_at INTEGER NOT NULL
 );
@@ -54,7 +56,7 @@ CREATE TABLE IF NOT EXISTS orders (
     position_id INTEGER NOT NULL, symbol TEXT NOT NULL,
     role TEXT NOT NULL, phase TEXT, reason TEXT,
     side TEXT NOT NULL, type TEXT NOT NULL, qty INTEGER NOT NULL,
-    limit_price REAL, stop_price REAL, tif TEXT, outside_rth INTEGER, oca_group TEXT,
+    limit_price REAL, stop_price REAL, trail_pct REAL, tif TEXT, outside_rth INTEGER, oca_group TEXT,
     broker_order_id TEXT, perm_id TEXT,
     status TEXT NOT NULL, filled REAL NOT NULL DEFAULT 0, avg_price REAL NOT NULL DEFAULT 0,
     message TEXT NOT NULL DEFAULT '',
@@ -89,6 +91,23 @@ class Store:
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA synchronous=NORMAL")
         self.conn.executescript(SCHEMA)
+        self._migrate()
+
+    # columns added after the first release: (table, column, definition)
+    MIGRATIONS = (
+        ("positions", "trail_pct", "REAL NOT NULL DEFAULT 0"),
+        ("positions", "trail_active", "INTEGER NOT NULL DEFAULT 0"),
+        ("positions", "trail_stop", "REAL"),
+        ("positions", "trail_time", "INTEGER"),
+        ("orders", "trail_pct", "REAL"),
+    )
+
+    def _migrate(self) -> None:
+        """Bring a database created by an older version up to the current schema."""
+        for table, column, definition in self.MIGRATIONS:
+            have = {r[1] for r in self.conn.execute(f"PRAGMA table_info({table})")}
+            if column not in have:
+                self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
     def close(self) -> None:
         self.conn.close()

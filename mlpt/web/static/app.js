@@ -34,7 +34,7 @@ const nyTime = (ts) => ts ? NY_FULL.format(new Date(ts * 1000)).replace(",", "")
 const SESSION = { PRE: ["טרום-מסחר", "warn"], RTH: ["שעות מסחר", "on"], POST: ["אחרי המסחר", "warn"], CLOSED: ["שוק סגור", "off"], HOLIDAY: ["אין מסחר היום", "off"] };
 const PHASE = { ENTERING: "בכניסה", INTRADAY: "תוך-יומי", SWING: "סווינג" };
 const WSTATUS = { WATCHING: ["במעקב", "on"], ENTERED: ["בוצעה כניסה", ""], NO_SIGNAL: ["אין אות", "off"], SKIPPED: ["דילוג", "warn"] };
-const REASON = { TP: "Take Profit", SL: "Stop Loss", MANUAL: "ידני", TIME: "מקס׳ ימים", EXTERNAL: "מחוץ למערכת" };
+const REASON = { TP: "Take Profit", SL: "Stop Loss", TRAIL: "סטופ נגרר", MANUAL: "ידני", TIME: "מקס׳ ימים", EXTERNAL: "מחוץ למערכת" };
 
 function table(el, head, rows, empty) {
   const th = head.map((h) => `<th class="${h.num ? "num" : ""}">${esc(h.t)}</th>`).join("");
@@ -131,11 +131,16 @@ async function loadOverview() {
     pos.items.map((p) => {
       const guard = p.state === "ENTERING" ? "" : p.halted ? '<span class="badge bad">נעצר – טיפול ידני</span>'
         : p.exit_request ? '<span class="badge warn">ביציאה</span>'
-        : p.protected ? '<span class="badge on">TP + SL פעילים</span>' : '<span class="badge bad">לא מוגן</span>';
+        : !p.protected ? '<span class="badge bad">לא מוגן</span>'
+        : p.trail_stop_now != null ? `<span class="badge on">סטופ נגרר ${plain(p.trail_pct)}% פעיל</span>`
+        : p.state === "INTRADAY" && p.trail_pct ? `<span class="badge on">SL פעיל · ביעד: סטופ נגרר ${plain(p.trail_pct)}%</span>`
+        : '<span class="badge on">TP + SL פעילים</span>';
       return `<tr><td class="sym">${esc(p.symbol)}</td><td><span class="badge">${PHASE[p.state] || p.state}</span></td>
         <td class="num">${p.qty_open || "–"}</td><td class="num">${usd(p.entry_price)}</td><td class="num">${usd(p.last)}</td>
         <td class="num ${cls(p.unrealized)}">${signed(p.unrealized)}</td><td class="num ${cls(p.unrealized_pct)}">${pct(p.unrealized_pct)}</td>
-        <td class="num">${usd(p.tp_price)}</td><td class="num">${usd(p.sl_price)}</td><td class="num">${p.days_held ?? "–"}</td><td>${guard}</td>
+        <td class="num">${p.trail_stop_now != null ? "–" : usd(p.tp_price)}</td>
+        <td class="num" title="${p.trail_stop_now != null ? "הערכה: הסטופ הנגרר זז אצל IBKR" : ""}">${p.trail_stop_now != null ? "≈ " + usd(p.trail_stop_now) : usd(p.sl_price)}</td>
+        <td class="num">${p.days_held ?? "–"}</td><td>${guard}</td>
         <td><button class="btn small ghost" data-chart="${esc(p.symbol)}">גרף</button>
         ${p.state !== "ENTERING" ? `<button class="btn small danger" data-close="${p.id}" data-sym="${esc(p.symbol)}">סגור</button>` : ""}</td></tr>`;
     }), "אין פוזיציות פתוחות");
@@ -269,7 +274,7 @@ function renderLegend(time) {
     ${bar.volume != null ? `<span>Vol ${Number(bar.volume).toLocaleString("en-US")}</span>` : ""}
     ${row.fast != null ? tag("--ma-fast", `${esc(d.ma_labels[0])} ${n(row.fast)}`) : ""}
     ${row.slow != null ? tag("--ma-slow", `${esc(d.ma_labels[1])} ${n(row.slow)}`) : ""}
-    ${d.levels.map((l) => `<span>${{ entry: "Entry", tp: "TP", sl: "SL" }[l.kind]} ${n(l.price)}</span>`).join("")}`;
+    ${d.levels.map((l) => `<span>${{ entry: "Entry", tp: "TP", sl: "SL", trail: "Trail ≈" }[l.kind]} ${n(l.price)}</span>`).join("")}`;
   $("#macd-legend").innerHTML = `<b>${esc(d.macd_label)}</b>` + (row.macd == null ? "<span>–</span>"
     : `${tag("--ma-fast", `MACD ${n(row.macd, 3)}`)}${row.signal != null ? tag("--ma-slow", `Signal ${n(row.signal, 3)}`) : ""}
        ${row.hist != null ? `<span>Hist ${n(row.hist, 3)}</span>` : ""}`);
@@ -334,7 +339,7 @@ async function loadCharts() {
     .map((x) => ({ time: x.time, position: "aboveBar", shape: "circle", color: x.ok ? cssVar("--up") : cssVar("--muted"), text: x.ok ? "✓" : "✕" }));
   macdLine.setMarkers([...buys, ...crosses].sort((a, b) => a.time - b.time));
   priceLines.forEach((l) => candles.removePriceLine(l));
-  const style = { entry: ["כניסה", cssVar("--accent")], tp: ["TP", cssVar("--up")], sl: ["SL", cssVar("--down")] };
+  const style = { entry: ["כניסה", cssVar("--accent")], tp: ["TP", cssVar("--up")], sl: ["SL", cssVar("--down")], trail: ["סטופ נגרר ≈", cssVar("--down")] };
   priceLines = d.levels.filter((l) => l.price).map((l) => candles.createPriceLine({
     price: l.price, color: style[l.kind][1], lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dashed, axisLabelVisible: true, title: style[l.kind][0] }));
   if (d.ma_labels[0]) { $("#key-fast").textContent = d.ma_labels[0]; $("#key-slow").textContent = d.ma_labels[1]; }
@@ -424,6 +429,7 @@ const SETTINGS = [
   ]],
   ["ברירות מחדל לעסקה (כשהתא ברשימה ריק)", [
     ["intraday_tp_pct", "יעד רווח תוך-יומי %", "number", ""],
+    ["intraday_trail_pct", "סטופ נגרר אחרי הגעה ליעד %", "number", "0 = כבוי (מכירה ביעד). למשל 0.2: ביעד לא מוכרים, וה-SL מוחלף בסטופ שנגרר 0.2% מתחת לשיא"],
     ["intraday_sl_pct", "סטופ תוך-יומי %", "number", "0 = הסטופ של הסווינג"],
     ["swing_tp_pct", "יעד רווח סווינג %", "number", ""],
     ["swing_sl_pct", "סטופ סווינג %", "number", ""],

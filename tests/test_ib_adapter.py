@@ -123,6 +123,11 @@ def test_order_construction(broker: IBBroker, monkeypatch):
     assert (sl.orderType, sl.auxPrice, sl.outsideRth, sl.ocaGroup, sl.account, sl.orderRef) == \
         ("STP", 96.0, False, "G", "DU123", "MLPT-1-SL")
     assert tp.transmit and sl.transmit and tp.totalQuantity == 10
+    trail_id = broker.place(OrderRequest("AAPL", "SELL", 10, "TRAIL", stop_price=100.4, trail_pct=0.2, tif="GTC",
+                                         ref="MLPT-1-INTRADAY-2-TRAIL"))
+    trail = placed[-1]
+    assert trail_id == "42" and (trail.orderType, trail.trailingPercent, trail.trailStopPrice) == ("TRAIL", 0.2, 100.4)
+    assert (trail.action, trail.tif, trail.ocaGroup, trail.outsideRth, trail.totalQuantity) == ("SELL", "GTC", "", False, 10)
     broker.connected = False
     with pytest.raises(ConnectionError):
         broker.place(OrderRequest("AAPL", "BUY", 1, "MKT"))
