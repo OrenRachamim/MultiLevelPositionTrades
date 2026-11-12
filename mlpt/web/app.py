@@ -14,12 +14,17 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from .. import __version__
-from ..config import Config
+import dataclasses
+import re
+
+from ..config import Config, Settings
 from ..engine import Engine
 from ..market_calendar import ET
 from ..models import INTRADAY, OPEN_STATES, SWING
 from ..notifier import TelegramNotifier
 from ..strategy import STRATEGIES
+from ..watchlist import SYMBOL_RE
+from .jobs import JobRunner
 
 STATIC = Path(__file__).parent / "static"
 
@@ -39,6 +44,49 @@ class WatchlistIn(BaseModel):
 
 class TradingIn(BaseModel):
     enabled: bool
+
+
+class BacktestIn(BaseModel):
+    first: str
+    last: str = ""
+    lists_from: str = "stored"          # stored | symbols | file
+    symbols: str = ""
+    lists_text: str = ""
+    overrides: dict[str, Any] = {}
+    vary_key: str = ""
+    vary_values: str = ""
+    cash: float = 100_000.0
+
+
+class DownloadIn(BaseModel):
+    first: str
+    last: str = ""
+    symbols: str = ""
+    force: bool = False
+
+
+SETTING_KEYS = {f.name for f in dataclasses.fields(Settings)}
+
+
+def _dates(first: str, last: str) -> tuple[str, str]:
+    try:
+        a = dt.date.fromisoformat(first)
+        b = dt.date.fromisoformat(last) if last else a
+    except ValueError:
+        raise HTTPException(400, "תאריך לא תקין") from None
+    if b < a:
+        raise HTTPException(400, "תאריך הסיום לפני תאריך ההתחלה")
+    if (b - a).days > 400:
+        raise HTTPException(400, "טווח ארוך מדי (עד 400 ימים)")
+    return a.isoformat(), b.isoformat()
+
+
+def _symbols(text: str) -> list[str]:
+    out = [s.upper() for s in re.split(r"[,;\s]+", text) if s]
+    bad = [s for s in out if not SYMBOL_RE.match(s)]
+    if bad:
+        raise HTTPException(400, f"סימול לא תקין: {', '.join(bad[:5])}")
+    return list(dict.fromkeys(out))
 
 
 def asset_version() -> str:
@@ -162,6 +210,70 @@ def create_app(engine: Engine, cfg: Config) -> FastAPI:
             return engine.explain(symbol.upper(), date)
         except ValueError:
             raise HTTPException(400, "bad date") from None
+
+    # --- back-test ----------------------------------------------------------
+    jobs = JobRunner(cfg)
+    source = cfg.mode          # the database that holds this dashboard's bars and lists
+
+    @app.get("/api/backtest")
+    def backtest_status() -> dict[str, Any]:
+        return {**jobs.status(), "source": source, "can_download": cfg.mode in ("paper", "live"),
+                "settings": engine.settings.to_dict()}
+
+    @app.post("/api/backtest/run")
+    def backtest_run(body: BacktestIn) -> dict[str, Any]:
+        first, last = _dates(body.first, body.last)
+        args = ["backtest", "--from", first, "--to", last, "--source", source, "--cash", str(body.cash),
+                "--json", str(jobs.result_path), "--db-name", "backtest"]
+        if body.lists_from == "symbols":
+            symbols = _symbols(body.symbols)
+            if not symbols:
+                raise HTTPException(400, "לא הוזנו מניות")
+            args += ["--symbols", ",".join(symbols)]
+        elif body.lists_from == "file":
+            if not body.lists_text.strip():
+                raise HTTPException(400, "לא הוזן קובץ רשימות")
+            if len(body.lists_text) > 2_000_000:
+                raise HTTPException(413, "קובץ הרשימות גדול מדי")
+            jobs.dir.mkdir(parents=True, exist_ok=True)
+            jobs.lists_path.write_text(body.lists_text, encoding="utf-8")
+            args += ["--lists", str(jobs.lists_path)]
+        elif body.lists_from != "stored":
+            raise HTTPException(400, "lists_from must be stored, symbols or file")
+        overrides = {k: v for k, v in body.overrides.items() if str(v).strip() != ""}
+        unknown = [k for k in list(overrides) + ([body.vary_key] if body.vary_key else []) if k not in SETTING_KEYS]
+        if unknown:
+            raise HTTPException(400, f"הגדרה לא מוכרת: {', '.join(unknown)}")
+        for k, v in overrides.items():
+            args += ["--set", f"{k}={v}"]
+        if body.vary_key:
+            values = [v.strip() for v in body.vary_values.split(",") if v.strip()]
+            if not 1 <= len(values) <= 8:
+                raise HTTPException(400, "להשוואה יש להזין בין 1 ל-8 ערכים, מופרדים בפסיקים")
+            if any(not re.fullmatch(r"[\w.:\-]+", v) for v in values):
+                raise HTTPException(400, "ערך לא תקין להשוואה")
+            args += ["--vary", f"{body.vary_key}={','.join(values)}"]
+        ok, msg = jobs.start("backtest", args)
+        return {"ok": ok, "message": msg}
+
+    @app.post("/api/backtest/download")
+    def backtest_download(body: DownloadIn) -> dict[str, Any]:
+        if cfg.mode not in ("paper", "live"):
+            return {"ok": False, "message": "הורדת נרות זמינה רק כשהמערכת מחוברת ל-IBKR (לא בסימולציה)"}
+        first, last = _dates(body.first, body.last)
+        args = ["--mode", cfg.mode, "download", "--from", first, "--to", last]
+        symbols = _symbols(body.symbols)
+        if symbols:
+            args += ["--symbols", ",".join(symbols)]
+        if body.force:
+            args.append("--force")
+        ok, msg = jobs.start("download", args)
+        return {"ok": ok, "message": msg}
+
+    @app.post("/api/backtest/cancel")
+    def backtest_cancel() -> dict[str, Any]:
+        ok, msg = jobs.cancel()
+        return {"ok": ok, "message": msg}
 
     # --- log ----------------------------------------------------------------
     @app.get("/api/events")

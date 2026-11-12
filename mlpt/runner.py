@@ -208,6 +208,20 @@ def stats(store: Store, sim: SimBroker) -> dict[str, Any]:
     }
 
 
+def trade_rows(store: Store) -> list[dict[str, Any]]:
+    out = []
+    for r in store._all("SELECT * FROM positions WHERE state != 'CANCELLED' ORDER BY id"):
+        out.append({
+            "symbol": r["symbol"], "trade_date": r["trade_date"], "qty": r["qty"], "state": r["state"],
+            "entry_price": r["entry_price"], "exit_price": r["exit_price"], "pnl": r["pnl"], "pnl_pct": r["pnl_pct"],
+            "exit_phase": r["exit_phase"], "exit_reason": r["exit_reason"], "signal": r["signal"],
+            "entry_time": to_et(r["entry_time"]).strftime("%H:%M") if r["entry_time"] else None,
+            "exit_date": to_et(r["exit_time"]).date().isoformat() if r["exit_time"] else None,
+            "exit_time": to_et(r["exit_time"]).strftime("%H:%M") if r["exit_time"] else None,
+        })
+    return out
+
+
 def format_stats(s: dict[str, Any]) -> str:
     lines = [
         f"stocks on the lists {s['listed']} | no signal {s['no_signal']} | skipped {s['skipped']} | entries {s['trades']}",
@@ -293,6 +307,7 @@ async def run_sim(cfg: Config, kind: str, *, first: Optional[dt.date] = None, da
         if trades:
             print(summary(store))
         print(format_stats(result))
+        result["rows"] = trade_rows(store)
         return result
 
     async def drive_then_idle() -> None:
@@ -308,24 +323,46 @@ async def run_sim(cfg: Config, kind: str, *, first: Optional[dt.date] = None, da
 
 async def run_backtest(cfg: Config, *, first: dt.date, last: dt.date, source_mode: str, cash: float,
                        overrides: dict[str, Any], vary: Optional[tuple[str, list[str]]],
-                       symbols: Optional[list[str]], lists: Optional[dict[str, str]], web: bool) -> None:
+                       symbols: Optional[list[str]], lists: Optional[dict[str, str]], web: bool,
+                       json_path: str = "", db_name: str = "") -> None:
     """Run the strategy over recorded / downloaded bars; optionally once per value of one setting."""
+    import json
+
+    cfg.db_name = db_name
     common: dict[str, Any] = dict(first=first, last=last, source_mode=source_mode, cash=cash,
                                   symbols=symbols, lists=lists)
-    if vary is None:
+    if vary is None and not json_path:
         await run_sim(cfg, "replay", overrides=overrides, web=web, speed=0, quiet=True, **common)
         return
-    key, values = vary
-    results = []
+    key, values = vary if vary else ("", [""])
+    runs = []
     for v in values:
-        print(f"\n===== {key} = {v} =====")
-        results.append((v, await run_sim(cfg, "replay", overrides={**overrides, key: v}, web=False,
-                                         quiet=True, trades=False, **common)))
-    print(f"\n{key:>22} {'entries':>8} {'closed':>7} {'win %':>6} {'realized':>11} {'open':>5} {'TOTAL':>11}")
-    for v, r in results:
-        print(f"{v:>22} {r['trades']:>8} {r['closed']:>7} {r['win_rate']:>6.0f} {r['realized']:>+11.2f} "
-              f"{r['open']:>5} {r['total']:>+11.2f}")
-    print("(the dashboard database data/mlpt_sim.db holds the last run)")
+        if key:
+            print(f"\n===== {key} = {v} =====", flush=True)
+        r = await run_sim(cfg, "replay", overrides={**overrides, key: v} if key else overrides, web=False,
+                          quiet=True, trades=not key, **common)
+        runs.append({"label": f"{key} = {v}" if key else "backtest", "value": v, **(r or {})})
+    if key:
+        print(f"\n{key:>22} {'entries':>8} {'closed':>7} {'win %':>6} {'realized':>11} {'open':>5} {'TOTAL':>11}")
+        for r in runs:
+            print(f"{r['value']:>22} {r['trades']:>8} {r['closed']:>7} {r['win_rate']:>6.0f} "
+                  f"{r['realized']:>+11.2f} {r['open']:>5} {r['total']:>+11.2f}")
+        print(f"(the database {cfg.db_path} holds the last run)")
+    if json_path:
+        # which days of the range have no bars at all: "no trades" must not be mistaken for "no data"
+        calendar = calendar_from(cfg)
+        source = Store(Path(cfg.data_dir) / f"mlpt_{source_mode}.db")
+        days, missing, d = 0, [], first
+        while d <= last:
+            if calendar.is_trading_day(d):
+                days += 1
+                if not source.bar_symbols(*day_range(d)):
+                    missing.append(d.isoformat())
+            d += dt.timedelta(days=1)
+        source.close()
+        payload = {"first": first.isoformat(), "last": last.isoformat(), "vary": key, "overrides": overrides,
+                   "cash": cash, "days": days, "missing_days": missing, "runs": runs}
+        Path(json_path).write_text(json.dumps(payload), encoding="utf-8")
 
 
 # --------------------------------------------------------------- download ---

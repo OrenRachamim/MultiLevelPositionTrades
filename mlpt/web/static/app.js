@@ -496,6 +496,172 @@ $("#tg-test").addEventListener("click", async (e) => {
   msg.textContent = "טלגרם: " + r.message; msg.className = r.ok ? "msg-ok" : "msg-err";
 });
 
+// ------------------------------------------------------------------- backtest
+const SETTING_LABEL = Object.fromEntries(SETTINGS.flatMap(([, fields]) => fields.map(([key, label]) => [key, label])));
+let btReady = false, btKey = "", btData = null, btRun = 0, btChart = null, btSeries = [], btError = "";
+const btListsFrom = () => document.querySelector('input[name="bt-lists"]:checked').value;
+
+function btForm() {
+  const overrides = {};
+  for (const line of $("#bt-set").value.split("\n")) {
+    const i = line.indexOf("=");
+    if (i > 0) overrides[line.slice(0, i).trim()] = line.slice(i + 1).trim();
+  }
+  return { first: $("#bt-first").value, last: $("#bt-last").value, lists_from: btListsFrom(), symbols: $("#bt-symbols").value,
+    lists_text: $("#bt-lists-text").value, overrides, vary_key: $("#bt-vary-key").value, vary_values: $("#bt-vary-values").value,
+    cash: Number($("#bt-cash").value) || 100000 };
+}
+
+async function btStart(path, body) {
+  // a refused request stays on screen until the next attempt (the job status must not overwrite it)
+  btError = "";
+  if (!body.first) btError = "בחר תאריך התחלה";
+  else {
+    try {
+      const r = await api(path, { method: "POST", body });
+      if (!r.ok) btError = r.message;
+    } catch (err) { btError = err.message; }
+  }
+  loadBacktest();
+}
+$("#bt-run").addEventListener("click", () => btStart("/api/backtest/run", btForm()));
+$("#bt-download").addEventListener("click", () => {
+  const f = btForm();
+  let symbols = f.lists_from === "symbols" ? f.symbols : "";
+  if (f.lists_from === "file") {          // the stocks named in the historical lists
+    const lines = f.lists_text.trim().split("\n").map((l) => l.split(/[,;\t]/).map((c) => c.trim()));
+    const col = (lines[0] || []).map((h) => h.toLowerCase()).indexOf("symbol");
+    symbols = col < 0 ? "" : [...new Set(lines.slice(1).map((l) => (l[col] || "").toUpperCase()).filter(Boolean))].join(",");
+  }
+  btStart("/api/backtest/download", { first: f.first, last: f.last, symbols });
+});
+$("#bt-cancel").addEventListener("click", async () => { await api("/api/backtest/cancel", { method: "POST" }); loadBacktest(); });
+document.querySelectorAll('input[name="bt-lists"]').forEach((el) => el.addEventListener("change", () => {
+  $("#bt-symbols-row").hidden = btListsFrom() !== "symbols";
+  $("#bt-file-row").hidden = btListsFrom() !== "file";
+}));
+$("#bt-file").addEventListener("change", (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = () => { $("#bt-lists-text").value = reader.result; };
+  reader.readAsText(file);
+});
+$("#bt-run-select").addEventListener("change", (e) => { btRun = Number(e.target.value); renderBtRun(); });
+$("#bt-compare").addEventListener("click", (e) => {
+  const tr = e.target.closest("tr[data-run]");
+  if (tr) { btRun = Number(tr.dataset.run); $("#bt-run-select").value = btRun; renderBtRun(); }
+});
+
+async function loadBacktest() {
+  const st = await api("/api/backtest");
+  if (!btReady) {
+    btReady = true;
+    $("#bt-last").value = state.status.today;
+    const d = new Date(state.status.today + "T00:00:00Z"); d.setUTCDate(d.getUTCDate() - 14);
+    $("#bt-first").value = d.toISOString().slice(0, 10);
+    $("#bt-vary-key").insertAdjacentHTML("beforeend", Object.keys(st.settings).filter((k) => SETTING_LABEL[k] && k !== "strategy")
+      .map((k) => `<option value="${esc(k)}">${esc(SETTING_LABEL[k])} · ${esc(k)} (כעת ${esc(st.settings[k])})</option>`).join(""));
+    $("#bt-download").disabled = !st.can_download;
+    if (!st.can_download) $("#bt-download").title = "זמין רק כשהמערכת מחוברת ל-IBKR";
+  }
+  const running = st.state === "running";
+  $("#bt-run").disabled = running;
+  $("#bt-download").disabled = running || !st.can_download;
+  $("#bt-cancel").hidden = !running;
+  const what = st.kind === "download" ? "הורדת נרות" : "Backtest";
+  const label = $("#bt-state");
+  if (btError) { label.textContent = btError; label.className = "msg-err"; }
+  else if (st.state !== "idle") {
+    label.textContent = { running: `${what} רץ… ${st.elapsed} שניות`, done: `${what} הסתיים (${st.elapsed} שניות)`, failed: `${what} נכשל או נעצר – ראה פירוט למטה` }[st.state];
+    label.className = st.state === "failed" ? "msg-err" : st.state === "done" ? "msg-ok" : "muted";
+  }
+  const log = $("#bt-log");
+  log.hidden = !st.log || (st.state === "done" && st.kind === "backtest");
+  if (!log.hidden && log.textContent !== st.log) { log.textContent = st.log; log.scrollTop = log.scrollHeight; }
+  const key = st.result ? `${st.result.first}|${st.result.last}|${st.elapsed}|${st.result.runs.length}` : "";
+  if (key !== btKey) { btKey = key; btData = st.result; btRun = 0; renderBtResult(); }
+}
+
+function renderBtResult() {
+  const d = btData;
+  $("#bt-results").hidden = !d;
+  if (!d) return;
+  $("#bt-range").textContent = `${d.first} – ${d.last} · ${d.days} ימי מסחר`;
+  const notes = [];
+  if (d.missing_days.length) notes.push(`ב-${d.missing_days.length} מתוך ${d.days} ימי המסחר בטווח אין נרות בכלל (${d.missing_days.slice(0, 6).join(", ")}${d.missing_days.length > 6 ? "…" : ""}). הורד נרות לטווח או בחר טווח אחר.`);
+  if (d.runs.every((r) => !r.listed)) notes.push("לא נמצאו רשימות יומיות לימים האלה – בחר ״אותן מניות בכל יום״ או טען קובץ רשימות.");
+  const set = Object.entries(d.overrides || {}).map(([k, v]) => `${k}=${v}`).join(", ");
+  $("#bt-notes").innerHTML = notes.map((n) => `<p class="note-warn">${esc(n)}</p>`).join("")
+    + (set ? `<p class="muted">הגדרות להרצה: <span class="num">${esc(set)}</span></p>` : "");
+  table($("#bt-compare"), [{ t: "הרצה" }, { t: "מניות ברשימות", num: 1 }, { t: "כניסות", num: 1 }, { t: "נסגרו", num: 1 }, { t: "% רווחיות", num: 1 },
+    { t: "רווח ממוצע", num: 1 }, { t: "הפסד ממוצע", num: 1 }, { t: "ממומש", num: 1 }, { t: "פתוחות", num: 1 }, { t: "סה״כ כולל פתוחות", num: 1 }],
+    d.runs.map((r, i) => `<tr data-run="${i}"><td class="sym"><i class="swatch" style="border-color:${cssVar("--series-" + (i + 1))}"></i>${esc(r.label)}</td>
+      <td class="num">${r.listed}</td><td class="num">${r.trades}</td><td class="num">${r.closed}</td><td class="num">${r.closed ? r.win_rate.toFixed(0) + "%" : "–"}</td>
+      <td class="num">${r.wins ? signed(r.avg_win) : "–"}</td><td class="num">${r.closed - r.wins ? signed(r.avg_loss) : "–"}</td>
+      <td class="num ${cls(r.realized)}">${signed(r.realized)}</td><td class="num">${r.open}</td><td class="num ${cls(r.total)}"><b>${signed(r.total)}</b></td></tr>`),
+    "אין תוצאות");
+  $("#bt-run-select").innerHTML = d.runs.map((r, i) => `<option value="${i}">${esc(r.label)}</option>`).join("");
+  $("#bt-run-select").hidden = d.runs.length < 2;
+  renderBtEquity();
+  renderBtRun();
+}
+
+function renderBtEquity() {
+  const d = btData;
+  // cumulative realized P&L per exit day, one line per run
+  const lines = d.runs.map((r) => {
+    const perDay = {};
+    for (const t of r.rows) if (t.exit_date && t.pnl != null) perDay[t.exit_date] = (perDay[t.exit_date] || 0) + t.pnl;
+    let sum = 0;
+    return Object.keys(perDay).sort().map((day) => ({ time: day, value: +(sum += perDay[day]).toFixed(2) }));
+  });
+  const show = lines.some((l) => l.length > 1);
+  $("#bt-equity-wrap").hidden = !show;
+  if (!show) return;
+  if (!btChart) {
+    btChart = LightweightCharts.createChart($("#bt-equity"), {
+      autoSize: true, layout: { background: { color: cssVar("--surface") }, textColor: cssVar("--text-2"), fontFamily: "Segoe UI, system-ui, Arial, sans-serif" },
+      grid: { vertLines: { color: cssVar("--grid") }, horzLines: { color: cssVar("--grid") } },
+      rightPriceScale: { borderColor: cssVar("--border") }, timeScale: { borderColor: cssVar("--border") },
+      crosshair: { mode: LightweightCharts.CrosshairMode.Normal }, localization: { locale: "en-GB" } });
+  }
+  btSeries.forEach((s) => btChart.removeSeries(s));
+  btSeries = lines.map((data, i) => {
+    const s = btChart.addLineSeries({ color: cssVar("--series-" + (i + 1)), lineWidth: 2, priceLineVisible: false, lastValueVisible: lines.length <= 4 });
+    s.setData(data);
+    return s;
+  });
+  btSeries[0].createPriceLine({ price: 0, color: cssVar("--muted"), lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Solid, axisLabelVisible: false });
+  $("#bt-equity-legend").innerHTML = d.runs.map((r, i) => `<span><i style="border-color:${cssVar("--series-" + (i + 1))}"></i>${esc(r.label)} · <span class="num">${signed(r.realized)}</span></span>`).join("");
+  btChart.timeScale().fitContent();
+}
+
+function renderBtRun() {
+  const d = btData;
+  if (!d) return;
+  const r = d.runs[btRun] || d.runs[0];
+  document.querySelectorAll("#bt-compare tr[data-run]").forEach((tr) => tr.classList.toggle("selected", Number(tr.dataset.run) === btRun && d.runs.length > 1));
+  const tile = (label, value, sub, c = "") => `<div class="tile"><label>${label}</label><b class="num ${c}">${value}</b><small>${sub}</small></div>`;
+  $("#bt-tiles").innerHTML =
+    tile("סה״כ כולל פתוחות", signed(r.total), `אחרי עמלות (${usd(r.commission)})`, cls(r.total)) +
+    tile("כניסות", r.trades, `מתוך ${r.listed} מניות ברשימות · ${r.no_signal} בלי אות · ${r.skipped} דילוגים`) +
+    tile("עסקאות שנסגרו", r.closed, r.closed ? `${r.wins} רווחיות (${r.win_rate.toFixed(0)}%)` : "–") +
+    tile("פתוחות בסוף הטווח", r.open, r.open ? `שערוך לפי מחיר אחרון: ${signed(r.unrealized)}` : "–");
+  $("#bt-exits").innerHTML = "לפי סוג יציאה: " + (Object.entries(r.by_exit).map(([k, [n, pnl]]) => {
+    const [ph, why] = k.split(" ");
+    return `${PHASE[ph] || esc(ph)} · ${REASON[why] || esc(why)}: ${n} עסקאות, <span class="num">${signed(pnl)}</span>`;
+  }).join(" | ") || "–");
+  table($("#bt-trades"), [{ t: "מניה" }, { t: "יום כניסה", num: 1 }, { t: "שעה", num: 1 }, { t: "כמות", num: 1 }, { t: "כניסה", num: 1 }, { t: "יציאה", num: 1 },
+    { t: "רווח/הפסד", num: 1 }, { t: "%", num: 1 }, { t: "נסגרה כ־" }, { t: "סיבה" }, { t: "יציאה ב־", num: 1 }, { t: "אות הכניסה" }],
+    r.rows.map((t) => `<tr><td class="sym">${esc(t.symbol)}</td><td class="num">${esc(t.trade_date)}</td><td class="num">${esc(t.entry_time || "–")}</td>
+      <td class="num">${t.qty}</td><td class="num">${usd(t.entry_price)}</td><td class="num">${t.exit_price == null ? "–" : usd(t.exit_price)}</td>
+      <td class="num ${cls(t.pnl)}">${t.pnl == null ? "–" : signed(t.pnl)}</td><td class="num ${cls(t.pnl_pct)}">${t.pnl_pct == null ? "–" : pct(t.pnl_pct)}</td>
+      <td>${t.state !== "CLOSED" ? '<span class="badge">פתוחה</span>' : PHASE[t.exit_phase] || esc(t.exit_phase)}</td><td>${REASON[t.exit_reason] || esc(t.exit_reason || "")}</td>
+      <td class="num">${t.exit_date ? esc(t.exit_date + " " + t.exit_time) : "–"}</td><td class="wrap">${esc(t.signal)}</td></tr>`),
+    "לא בוצעה אף כניסה בהרצה הזו");
+}
+
 // ------------------------------------------------------------------------ log
 async function loadLog() {
   const level = $("#log-level").value, symbol = $("#log-symbol").value.trim();
@@ -506,7 +672,7 @@ $("#log-level").addEventListener("change", loadLog);
 $("#log-symbol").addEventListener("input", loadLog);
 
 // ---------------------------------------------------------------------- shell
-const LOADERS = { overview: loadOverview, charts: loadCharts, list: loadList, history: loadHistory, settings: loadSettings, log: loadLog };
+const LOADERS = { overview: loadOverview, charts: loadCharts, list: loadList, history: loadHistory, backtest: loadBacktest, settings: loadSettings, log: loadLog };
 
 function showTab() {
   const tab = (location.hash || "#overview").slice(1);

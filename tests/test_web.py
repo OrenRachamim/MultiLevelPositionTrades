@@ -100,3 +100,56 @@ def test_chart_reports_why_macd_is_empty(rig: Rig):
     chart = c.get(f"/api/chart?symbol=AAPL&date={D1}").json()
     assert chart["indicator_bars"] == 40 and len(chart["macd"]) == 15      # line from bar 26
     assert len(chart["macd_signal"]) == 7 and len(chart["macd_hist"]) == 7  # signal from bar 34
+
+
+def test_backtest_job_runs_in_a_separate_process(tmp_path):
+    import datetime as dt
+    import time
+
+    from mlpt.db import Store
+    from mlpt.models import Bar
+
+    # source data: a sell-off and recovery after the open, which the MACD rule buys
+    src = Store(tmp_path / "mlpt_sim.db")
+    prev = [Bar(ts(dt.date(2026, 11, 9), 9, 30) + i * 60, 100, 100.05, 99.95, 100.0) for i in range(90)]
+    closes = [100 - 0.08 * i for i in range(1, 17)]
+    closes += [closes[-1] + 0.06 * i for i in range(1, 60)]
+    today = [Bar(ts(D1, 9, 30) + i * 60, c, c + 0.03, c - 0.03, c) for i, c in enumerate(closes)]
+    src.save_bars("AAPL", prev + today)
+    src.close()
+
+    rig = Rig()
+    cfg = Config(mode="sim", data_dir=str(tmp_path))
+    c = TestClient(create_app(rig.engine, cfg))
+    st = c.get("/api/backtest").json()
+    assert st["state"] == "idle" and st["source"] == "sim" and st["can_download"] is False and st["result"] is None
+
+    body = {"first": D1.isoformat(), "last": D1.isoformat(), "lists_from": "symbols", "symbols": "aapl"}
+    assert c.post("/api/backtest/run", json={**body, "symbols": "AAPL, $$"}, headers=H).status_code == 400
+    assert c.post("/api/backtest/run", json={**body, "overrides": {"no_such": 1}}, headers=H).status_code == 400
+    assert c.post("/api/backtest/run", json={**body, "last": "2026-11-01"}, headers=H).status_code == 400
+    assert c.post("/api/backtest/run", json={**body, "vary_key": "intraday_trail_pct", "vary_values": "0;rm"},
+                  headers=H).status_code == 400
+    assert c.post("/api/backtest/run", json=body).status_code == 403                 # custom header required
+    assert c.post("/api/backtest/download", json=body, headers=H).json()["ok"] is False  # not in simulation
+
+    r = c.post("/api/backtest/run", json={**body, "vary_key": "intraday_trail_pct", "vary_values": "0, 0.2"},
+               headers=H).json()
+    assert r["ok"], r
+    assert c.post("/api/backtest/run", json=body, headers=H).json()["ok"] is False   # one job at a time
+    for _ in range(120):
+        st = c.get("/api/backtest").json()
+        if st["state"] != "running":
+            break
+        time.sleep(0.25)
+    assert st["state"] == "done", st["log"]
+    res = st["result"]
+    assert (res["first"], res["days"], res["missing_days"], res["vary"]) == (D1.isoformat(), 1, [], "intraday_trail_pct")
+    assert [run["label"] for run in res["runs"]] == ["intraday_trail_pct = 0", "intraday_trail_pct = 0.2"]
+    plain, trail = res["runs"]
+    assert plain["trades"] == 1 and plain["rows"][0]["symbol"] == "AAPL" and plain["rows"][0]["exit_reason"] == "TP"
+    # the price only rises in this data, so the trailing stop is never hit: the position stays open
+    assert trail["trades"] == 1 and trail["open"] == 1 and trail["rows"][0]["exit_reason"] is None
+    assert "MACD" in trail["rows"][0]["signal"] and trail["unrealized"] > plain["realized"]
+    assert rig.positions() == [] and rig.engine.settings.intraday_trail_pct == 0     # the live engine is untouched
+    assert (tmp_path / "mlpt_backtest.db").exists()

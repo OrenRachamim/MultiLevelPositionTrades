@@ -24,6 +24,8 @@ def _overrides(pairs: list[str]) -> dict[str, Any]:
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="mlpt", description="Intraday-first / swing-fallback trading over IB Gateway")
     ap.add_argument("-c", "--config", default=None, help="path to config.toml (default: ./config.toml)")
+    ap.add_argument("--data-dir", default=None, help="override data_dir of the config file")
+    ap.add_argument("--mode", default=None, choices=("paper", "live", "sim"), help="override mode of the config file")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("run", help="trade through IB Gateway (paper or live, per config.toml)")
@@ -61,7 +63,10 @@ def main(argv: list[str] | None = None) -> int:
     bt.add_argument("--to", dest="last", default="", help="last trading day (default: same as --from)")
     bt.add_argument("--symbols", default="", help="comma separated: trade these stocks on every day")
     bt.add_argument("--lists", default="", help="CSV of historical daily lists: date,symbol,[list columns]")
-    bt.add_argument("--source", default="paper", choices=("paper", "live"), help="which database holds the bars")
+    bt.add_argument("--source", default="paper", choices=("paper", "live", "sim"),
+                    help="which database holds the bars")
+    bt.add_argument("--json", default="", help="also write the full result to this file (used by the dashboard)")
+    bt.add_argument("--db-name", default="", help="name of the scratch database (default: sim)")
     bt.add_argument("--cash", type=float, default=100_000.0)
     bt.add_argument("--set", action="append", default=[], metavar="KEY=VALUE", help="override a setting")
     bt.add_argument("--vary", default="", metavar="KEY=V1,V2,...",
@@ -73,6 +78,11 @@ def main(argv: list[str] | None = None) -> int:
         if hasattr(stream, "reconfigure"):
             stream.reconfigure(encoding="utf-8", errors="replace")
     cfg = load_config(args.config)
+    if args.data_dir:
+        cfg.data_dir = args.data_dir
+    if args.mode:
+        cfg.mode = args.mode
+        cfg.validate()
 
     from . import runner
 
@@ -108,7 +118,8 @@ def main(argv: list[str] | None = None) -> int:
                 cfg, first=first, last=dt.date.fromisoformat(args.last) if args.last else first,
                 source_mode=args.source, cash=args.cash, overrides=_overrides(args.set), vary=vary,
                 symbols=[s.strip().upper() for s in args.symbols.split(",") if s.strip()] or None,
-                lists=runner.read_lists(args.lists) if args.lists else None, web=args.web))
+                lists=runner.read_lists(args.lists) if args.lists else None, web=args.web,
+                json_path=args.json, db_name=args.db_name))
     except KeyboardInterrupt:
         pass
     return 0

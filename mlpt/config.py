@@ -47,11 +47,13 @@ class Config:
     ib: IBConfig = field(default_factory=IBConfig)
     web: WebConfig = field(default_factory=WebConfig)
     telegram: TelegramConfig = field(default_factory=TelegramConfig)
+    path: str = ""              # the config file this was read from, if any
+    db_name: str = ""           # overrides the mode in the database file name (back-tests)
 
     @property
     def db_path(self) -> Path:
         # one database per mode: paper, live and simulation never share state
-        return Path(self.data_dir) / f"mlpt_{self.mode}.db"
+        return Path(self.data_dir) / f"mlpt_{self.db_name or self.mode}.db"
 
     def validate(self) -> None:
         if self.mode not in MODES:
@@ -78,6 +80,7 @@ def load_config(path: str | os.PathLike | None = None) -> Config:
         ib=IBConfig(**raw.get("ib", {})),
         web=WebConfig(**raw.get("web", {})),
         telegram=TelegramConfig(**raw.get("telegram", {})),
+        path=str(p.resolve()) if p.exists() else "",
     )
     # secrets may also come from the environment
     cfg.telegram.bot_token = os.environ.get("MLPT_TELEGRAM_TOKEN", cfg.telegram.bot_token)

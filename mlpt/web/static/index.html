@@ -34,6 +34,7 @@
   <a href="#charts" data-tab="charts">גרפים</a>
   <a href="#list" data-tab="list">רשימה יומית</a>
   <a href="#history" data-tab="history">היסטוריה</a>
+  <a href="#backtest" data-tab="backtest">Backtest</a>
   <a href="#settings" data-tab="settings">הגדרות</a>
   <a href="#log" data-tab="log">לוג</a>
 </nav>
@@ -135,6 +136,72 @@
     <div class="panel">
       <h2>עסקאות סגורות</h2>
       <div class="scroll"><table id="closed-table"></table></div>
+    </div>
+  </section>
+
+  <section id="tab-backtest" class="tab" hidden>
+    <div class="panel">
+      <h2>Backtest – הרצת האסטרטגיה על נרות היסטוריים</h2>
+      <div class="form-row">
+        <label>מתאריך <input type="date" id="bt-first"></label>
+        <label>עד תאריך <input type="date" id="bt-last"></label>
+        <label>הון התחלתי $ <input type="number" id="bt-cash" value="100000" min="1000" step="1000" dir="ltr"></label>
+      </div>
+      <div class="form-row">
+        <span>הרשימה היומית:</span>
+        <label class="check"><input type="radio" name="bt-lists" value="stored" checked> הרשימות שנטענו למערכת באותם ימים</label>
+        <label class="check"><input type="radio" name="bt-lists" value="symbols"> אותן מניות בכל יום</label>
+        <label class="check"><input type="radio" name="bt-lists" value="file"> קובץ רשימות היסטוריות</label>
+      </div>
+      <div id="bt-symbols-row" class="form-row" hidden>
+        <input id="bt-symbols" dir="ltr" size="60" placeholder="AAPL, NVDA, MNDY">
+      </div>
+      <div id="bt-file-row" hidden>
+        <div class="form-row">
+          <label class="file">קובץ CSV <input type="file" id="bt-file" accept=".csv,.txt,text/csv,text/plain"></label>
+          <span class="muted">עמודת <span class="num">date</span> ועוד העמודות הרגילות של הרשימה היומית</span>
+        </div>
+        <textarea id="bt-lists-text" dir="ltr" spellcheck="false" rows="6"
+          placeholder="date,symbol,intraday_tp_pct,swing_tp_pct,swing_sl_pct&#10;2026-11-10,AAPL,0.5,6,4&#10;2026-11-10,NVDA,,,&#10;2026-11-11,MNDY,0.7,8,5"></textarea>
+      </div>
+      <div class="form-row">
+        <label>השוואה בין ערכים של
+          <select id="bt-vary-key"><option value="">– בלי השוואה –</option></select>
+        </label>
+        <label>ערכים <input id="bt-vary-values" dir="ltr" size="22" placeholder="0, 0.2, 0.4"></label>
+        <span class="muted">הרצה נפרדת לכל ערך</span>
+      </div>
+      <details>
+        <summary>הגדרות שונות מהנוכחיות להרצה הזו</summary>
+        <textarea id="bt-set" dir="ltr" spellcheck="false" rows="3" placeholder="intraday_tp_pct=0.7&#10;macd_min_depth_pct=0.2"></textarea>
+        <p class="muted">שורה לכל הגדרה, בצורה <span class="num">key=value</span>. שאר ההגדרות נלקחות מלשונית "הגדרות". ההרצה לא משנה את הגדרות המסחר.</p>
+      </details>
+      <div class="form-row">
+        <button id="bt-run" class="btn primary">הרץ Backtest</button>
+        <button id="bt-download" class="btn ghost">הורד נרות מ-IBKR לטווח</button>
+        <button id="bt-cancel" class="btn danger" hidden>עצור</button>
+        <span id="bt-state" class="muted"></span>
+      </div>
+      <pre id="bt-log" dir="ltr" hidden></pre>
+    </div>
+    <div id="bt-results" hidden>
+      <div class="panel">
+        <h2>תוצאות <span id="bt-range" class="muted num"></span></h2>
+        <div id="bt-notes"></div>
+        <div class="scroll"><table id="bt-compare"></table></div>
+        <div id="bt-equity-wrap">
+          <h3>רווח ממומש מצטבר ($) לפי יום היציאה</h3>
+          <div id="bt-equity-legend" class="series-legend"></div>
+          <div id="bt-equity" dir="ltr"></div>
+        </div>
+      </div>
+      <div class="panel">
+        <h2>עסקאות <select id="bt-run-select"></select></h2>
+        <div id="bt-tiles" class="tiles"></div>
+        <p id="bt-exits" class="muted"></p>
+        <div class="scroll tall"><table id="bt-trades"></table></div>
+      </div>
+      <p class="muted">הסימולציה ממלאת פקודות לפי נרות דקה, בלי ספר פקודות ובלי החלקה. עם יעדים וסטופים של עשיריות אחוז התוצאה היא הערכה גסה ואופטימית.</p>
     </div>
   </section>
 
