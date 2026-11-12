@@ -9,7 +9,7 @@ from mlpt.broker.sim import SimBroker
 from mlpt.config import Config, Settings
 from mlpt.market_calendar import MarketCalendar
 from mlpt.models import (O_CANCELLED, O_FILLED, O_REJECTED, Bar, OrderRequest, round_price)
-from mlpt.strategy import ema, ma_cross, ma_trend, sma
+from mlpt.strategy import ema, ma_cross, ma_trend, macd, macd_cross, sma
 from mlpt.watchlist import parse_watchlist
 
 
@@ -88,11 +88,82 @@ def test_ma_cross_fires_once_on_the_cross():
     assert ma_trend(bars_from(closes), s) is None                          # flat bars: close == open
 
 
+def test_macd_matches_a_direct_calculation():
+    closes = [100 + ((i * 37) % 11) * 0.3 - i * 0.05 for i in range(120)]
+    line, sig, hist = macd(closes, 11, 26, 9)
+    assert line[:25] == [None] * 25 and line[25] is not None
+    assert sig[:33] == [None] * 33 and sig[33] is not None             # 26 + 9 - 1 bars to warm up
+
+    def ema_ref(vals, n):                                               # textbook EMA, SMA-seeded
+        out, k = [sum(vals[:n]) / n], 2 / (n + 1)
+        for v in vals[n:]:
+            out.append(v * k + out[-1] * (1 - k))
+        return out
+
+    ref_line = [f - s for f, s in zip(ema_ref(closes, 11)[15:], ema_ref(closes, 26))]
+    ref_sig = ema_ref(ref_line, 9)
+    assert line[-1] == pytest.approx(ref_line[-1]) and sig[-1] == pytest.approx(ref_sig[-1])
+    assert hist[-1] == pytest.approx(ref_line[-1] - ref_sig[-1])
+    assert all(v == pytest.approx(0) for v in macd([50.0] * 60, 11, 26, 9)[0][25:])
+
+
+def day_bars(day, closes, start=(9, 30)):
+    t0 = ts(day, *start)
+    return [Bar(t0 + i * 60, c, c, c, c) for i, c in enumerate(closes)]
+
+
+def macd_fires(today_closes, prev_closes=None, **settings):
+    """Indexes of today's bars on which macd_cross gives a signal."""
+    s = Settings(**settings)
+    prev = day_bars(dt.date(2026, 11, 9), prev_closes or [100.0] * 90)
+    today = day_bars(D1, today_closes)
+    return [i for i in range(len(today)) if macd_cross(prev + today[:i + 1], s)]
+
+
+def test_macd_cross_buys_the_first_upturn_after_a_selloff():
+    down = [100 - 0.08 * i for i in range(1, 17)]                      # -1.3% in 16 minutes
+    up = [down[-1] + 0.06 * i for i in range(1, 30)]
+    fired = macd_fires(down + up)
+    assert len(fired) == 1                                             # one cross, one signal
+    i = fired[0]
+    assert i > len(down)                                               # after the low, on the way up
+    closes = [100.0] * 90 + down + up
+    line, sig, _ = macd(closes[:90 + i + 1], 11, 26, 9)
+    assert line[-1] < 0 and sig[-1] < 0 and line[-1] > sig[-1] and line[-2] <= sig[-2]
+    sig_text = macd_cross(day_bars(dt.date(2026, 11, 9), [100.0] * 90) + day_bars(D1, (down + up)[:i + 1]), Settings())
+    assert sig_text.price == (down + up)[i] and "MACD" in sig_text.reason
+
+
+def test_macd_cross_ignores_shallow_dips_and_crosses_above_zero():
+    shallow = [100 - 0.004 * i for i in range(1, 11)] + [99.96 + 0.01 * i for i in range(1, 30)]
+    assert macd_fires(shallow) == []                                   # below zero, but not "significant"
+    assert len(macd_fires(shallow, macd_min_depth_pct=0.0)) == 1       # threshold off: any cross below zero
+    # rally, small pullback, rally again: the cross happens above the zero line
+    rally = [100 + 0.1 * i for i in range(1, 31)] + [103 - 0.05 * i for i in range(1, 6)] + \
+            [102.75 + 0.1 * i for i in range(1, 20)]
+    line, sig, _ = macd([100.0] * 90 + rally, 11, 26, 9)
+    ups = [i for i in range(91, len(line)) if line[i - 1] <= sig[i - 1] and line[i] > sig[i]]
+    assert ups and all(line[i] > 0 for i in ups)                       # the data really has such a cross
+    assert macd_fires(rally, macd_min_depth_pct=0.0) == []
+
+
+def test_macd_cross_needs_the_selloff_to_happen_today():
+    # yesterday closed in a sell-off; today only recovers: the cross is not a signal
+    prev = [100.0] * 60 + [100 - 0.08 * i for i in range(1, 31)]
+    recover = [prev[-1] + 0.05 * i for i in range(1, 40)]
+    assert macd_fires(recover, prev_closes=prev) == []
+    # ...but a fresh leg down today followed by an upturn is
+    again = [prev[-1] + 0.02 * i for i in range(1, 6)] + [prev[-1] + 0.1 - 0.1 * i for i in range(1, 15)]
+    again += [again[-1] + 0.06 * i for i in range(1, 30)]
+    assert len(macd_fires(again, prev_closes=prev)) == 1
+
+
 def test_settings_validation_and_coercion():
     s = Settings.from_dict({"position_pct": "12.5", "ma_fast": "5", "tp_outside_rth": "false", "junk": 1})
     assert (s.position_pct, s.ma_fast, s.tp_outside_rth) == (12.5, 5, False)
     s.validate()
-    for bad in ({"ma_fast": 30}, {"position_pct": 0}, {"position_pct": 150}, {"entry_end": "09:00"},
+    assert (s.strategy, s.macd_fast, s.macd_slow, s.macd_signal) == ("macd_cross", 11, 26, 9)
+    for bad in ({"ma_fast": 30}, {"macd_fast": 26}, {"macd_signal": 0}, {"position_pct": 0}, {"position_pct": 150}, {"entry_end": "09:00"},
                 {"strategy": "nope"}, {"swing_sl_pct": 100}, {"entry_start": "9h"}):
         with pytest.raises(ValueError):
             Settings.from_dict(bad).validate()

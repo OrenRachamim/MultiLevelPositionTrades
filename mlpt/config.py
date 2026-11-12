@@ -121,7 +121,13 @@ class Settings:
     sl_outside_rth: bool = False
 
     # intraday entry strategy
-    strategy: str = "ma_cross"
+    strategy: str = "macd_cross"
+    macd_fast: int = 11
+    macd_slow: int = 26
+    macd_signal: int = 9
+    # how far below zero the MACD line must have dropped before the cross,
+    # as a percent of the share price (so one value fits every stock); 0 = any
+    macd_min_depth_pct: float = 0.10
     ma_type: str = "EMA"
     ma_fast: int = 9
     ma_slow: int = 20
@@ -137,15 +143,18 @@ class Settings:
         if self.position_pct > 100:
             raise ValueError("position_pct must be <= 100")
         for n in ("max_position_usd", "cash_reserve_usd", "max_open_positions",
-                  "intraday_sl_pct", "max_hold_days", "entry_slippage_pct"):
+                  "intraday_sl_pct", "max_hold_days", "entry_slippage_pct", "macd_min_depth_pct"):
             pos(n, allow_zero=True)
         for n in ("intraday_tp_pct", "swing_tp_pct", "swing_sl_pct",
-                  "entry_timeout_sec", "max_signal_age_sec", "ma_fast", "ma_slow"):
+                  "entry_timeout_sec", "max_signal_age_sec", "ma_fast", "ma_slow",
+                  "macd_fast", "macd_slow", "macd_signal"):
             pos(n)
         if self.swing_sl_pct >= 100 or self.intraday_sl_pct >= 100:
             raise ValueError("stop loss must be below 100%")
         if self.ma_fast >= self.ma_slow:
             raise ValueError("ma_fast must be smaller than ma_slow")
+        if self.macd_fast >= self.macd_slow:
+            raise ValueError("macd_fast must be smaller than macd_slow")
         if self.ma_type not in ("EMA", "SMA"):
             raise ValueError("ma_type must be EMA or SMA")
         from .strategy import STRATEGIES  # local import: avoid a cycle

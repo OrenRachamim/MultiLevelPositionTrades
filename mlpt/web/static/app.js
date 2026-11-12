@@ -157,44 +157,72 @@ document.addEventListener("click", async (e) => {
 
 // --------------------------------------------------------------------- charts
 let chart = null, candles = null, maFast = null, maSlow = null, priceLines = [], chartKey = "", lastChart = null;
+let macdChart = null, macdHist = null, macdLine = null, macdSignal = null;
 const cssVar = (n) => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
 
 function ensureChart() {
   if (chart) return;
   const c = { surface: cssVar("--surface"), text: cssVar("--text-2"), grid: cssVar("--grid"), border: cssVar("--border"), up: cssVar("--up"), down: cssVar("--down") };
-  chart = LightweightCharts.createChart($("#chart"), {
+  const base = (timeAxis) => ({
     autoSize: true,
     layout: { background: { color: c.surface }, textColor: c.text, fontFamily: "Segoe UI, system-ui, Arial, sans-serif" },
     grid: { vertLines: { color: c.grid }, horzLines: { color: c.grid } },
-    rightPriceScale: { borderColor: c.border },
-    timeScale: { borderColor: c.border, timeVisible: true, secondsVisible: false },
+    rightPriceScale: { borderColor: c.border, minimumWidth: 78 },   // same width: the two panes stay aligned
+    timeScale: { borderColor: c.border, timeVisible: true, secondsVisible: false, visible: timeAxis },
     crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
     localization: { locale: "en-GB" },
   });
+  const line = (ch, color) => ch.addLineSeries({ color, lineWidth: 2, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false });
+  chart = LightweightCharts.createChart($("#chart"), base(false));
   // rising candles are hollow, falling candles are filled: readable without relying on colour
   candles = chart.addCandlestickSeries({ upColor: c.surface, downColor: c.down, borderUpColor: c.up, borderDownColor: c.down, wickUpColor: c.up, wickDownColor: c.down, priceLineVisible: false });
-  maFast = chart.addLineSeries({ color: cssVar("--ma-fast"), lineWidth: 2, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false });
-  maSlow = chart.addLineSeries({ color: cssVar("--ma-slow"), lineWidth: 2, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false });
-  chart.subscribeCrosshairMove((p) => renderLegend(p && p.time ? p : null));
+  maFast = line(chart, cssVar("--ma-fast"));
+  maSlow = line(chart, cssVar("--ma-slow"));
+
+  // MACD pane: its own chart, kept in step with the price chart
+  macdChart = LightweightCharts.createChart($("#chart-macd"), base(true));
+  const fmt = { type: "price", precision: 3, minMove: 0.001 };
+  macdHist = macdChart.addHistogramSeries({ priceLineVisible: false, lastValueVisible: false, priceFormat: fmt });
+  macdLine = line(macdChart, cssVar("--ma-fast"));
+  macdSignal = line(macdChart, cssVar("--ma-slow"));
+  macdLine.applyOptions({ priceFormat: fmt });
+  macdSignal.applyOptions({ priceFormat: fmt });
+  macdLine.createPriceLine({ price: 0, color: cssVar("--muted"), lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Solid, axisLabelVisible: false });
+
+  let syncing = false;
+  const link = (a, b) => a.timeScale().subscribeVisibleLogicalRangeChange((r) => {
+    if (syncing || !r) return;
+    syncing = true; b.timeScale().setVisibleLogicalRange(r); syncing = false;
+  });
+  link(chart, macdChart); link(macdChart, chart);
+  chart.subscribeCrosshairMove((p) => {
+    renderLegend(p && p.time ? p.time : null);
+    const row = p && p.time && lastChart ? lastChart.byTime.get(p.time) : null;
+    if (row && row.macd != null) macdChart.setCrosshairPosition(row.macd, p.time, macdLine); else macdChart.clearCrosshairPosition();
+  });
+  macdChart.subscribeCrosshairMove((p) => {
+    renderLegend(p && p.time ? p.time : null);
+    const row = p && p.time && lastChart ? lastChart.byTime.get(p.time) : null;
+    if (row && p.sourceEvent) chart.setCrosshairPosition(row.bar.close, p.time, candles); else if (!p.time) chart.clearCrosshairPosition();
+  });
 }
 
-function renderLegend(point) {
+function renderLegend(time) {
   const d = lastChart;
-  if (!d || !d.bars.length) { $("#chart-legend").textContent = ""; return; }
-  let bar = d.bars[d.bars.length - 1], f = d.ma_fast[d.ma_fast.length - 1], s = d.ma_slow[d.ma_slow.length - 1];
-  if (point) {
-    bar = point.seriesData.get(candles) || bar;
-    f = point.seriesData.get(maFast); s = point.seriesData.get(maSlow);
-    const full = d.bars.find((b) => b.time === bar.time);
-    if (full) bar = full;
-  }
+  if (!d || !d.bars.length) { $("#chart-legend").textContent = ""; $("#macd-legend").textContent = ""; return; }
+  const row = d.byTime.get(time) || d.byTime.get(d.bars[d.bars.length - 1].time);
+  const bar = row.bar, n = (v, k = 2) => v.toFixed(k);
+  const tag = (color, text) => `<span style="border-bottom:2px solid ${cssVar(color)}">${text}</span>`;
   const hhmm = new Date(bar.time * 1000).toISOString().slice(11, 16);
   $("#chart-legend").innerHTML = `<b>${esc(d.symbol)}</b><span>${hhmm} NY${bar.rth === false ? " (ext)" : ""}</span>
-    <span>O ${bar.open.toFixed(2)}</span><span>H ${bar.high.toFixed(2)}</span><span>L ${bar.low.toFixed(2)}</span><span>C ${bar.close.toFixed(2)}</span>
+    <span>O ${n(bar.open)}</span><span>H ${n(bar.high)}</span><span>L ${n(bar.low)}</span><span>C ${n(bar.close)}</span>
     ${bar.volume != null ? `<span>Vol ${Number(bar.volume).toLocaleString("en-US")}</span>` : ""}
-    ${f ? `<span style="border-bottom:2px solid ${cssVar("--ma-fast")}">${esc(d.ma_labels[0])} ${f.value.toFixed(2)}</span>` : ""}
-    ${s ? `<span style="border-bottom:2px solid ${cssVar("--ma-slow")}">${esc(d.ma_labels[1])} ${s.value.toFixed(2)}</span>` : ""}
-    ${d.levels.map((l) => `<span>${{ entry: "Entry", tp: "TP", sl: "SL" }[l.kind]} ${l.price.toFixed(2)}</span>`).join("")}`;
+    ${row.fast != null ? tag("--ma-fast", `${esc(d.ma_labels[0])} ${n(row.fast)}`) : ""}
+    ${row.slow != null ? tag("--ma-slow", `${esc(d.ma_labels[1])} ${n(row.slow)}`) : ""}
+    ${d.levels.map((l) => `<span>${{ entry: "Entry", tp: "TP", sl: "SL" }[l.kind]} ${n(l.price)}</span>`).join("")}`;
+  $("#macd-legend").innerHTML = `<b>${esc(d.macd_label)}</b>` + (row.macd == null ? "<span>–</span>"
+    : `${tag("--ma-fast", `MACD ${n(row.macd, 3)}`)}${row.signal != null ? tag("--ma-slow", `Signal ${n(row.signal, 3)}`) : ""}
+       ${row.hist != null ? `<span>Hist ${n(row.hist, 3)}</span>` : ""}`);
 }
 
 async function loadCharts() {
@@ -211,14 +239,28 @@ async function loadCharts() {
   const ext = $("#chart-ext").checked, extColor = cssVar("--ext");
   const bars = d.bars.filter((b) => ext || b.rth).map((b) => b.rth ? b
     : { ...b, color: b.close >= b.open ? cssVar("--surface") : extColor, borderColor: extColor, wickColor: extColor });
-  lastChart = { ...d, bars };
+  const byTime = new Map(bars.map((b) => [b.time, { bar: b }]));
+  const attach = (key, points) => points.forEach((p) => { const row = byTime.get(p.time); if (row) row[key] = p.value; });
+  attach("fast", d.ma_fast); attach("slow", d.ma_slow);
+  attach("macd", d.macd); attach("signal", d.macd_signal); attach("hist", d.macd_hist);
+  lastChart = { ...d, bars, byTime };
+  // every series carries every bar time (empty where there is no value) so both panes share one time axis
+  const series = (key, extra) => bars.map((b) => {
+    const v = byTime.get(b.time)[key];
+    return v == null ? { time: b.time } : { time: b.time, value: v, ...(extra ? extra(v) : {}) };
+  });
   candles.setData(bars);
-  maFast.setData(d.ma_fast);
-  maSlow.setData(d.ma_slow);
-  const shown = new Set(bars.map((b) => b.time));
-  candles.setMarkers(d.markers.filter((m) => shown.has(m.time)).map((m) => m.kind === "entry"
+  maFast.setData(series("fast"));
+  maSlow.setData(series("slow"));
+  macdLine.setData(series("macd"));
+  macdSignal.setData(series("signal"));
+  macdHist.setData(series("hist", (v) => ({ color: v >= 0 ? cssVar("--up") + "88" : cssVar("--down") + "88" })));
+  const marks = d.markers.filter((m) => byTime.has(m.time));
+  candles.setMarkers(marks.map((m) => m.kind === "entry"
     ? { time: m.time, position: "belowBar", shape: "arrowUp", color: cssVar("--accent"), text: m.text }
     : { time: m.time, position: "aboveBar", shape: "arrowDown", color: m.win ? cssVar("--up") : cssVar("--down"), text: m.text }));
+  macdLine.setMarkers(marks.filter((m) => m.kind === "entry" && byTime.get(m.time).macd != null)
+    .map((m) => ({ time: m.time, position: "belowBar", shape: "arrowUp", color: cssVar("--accent"), text: "BUY" })));
   priceLines.forEach((l) => candles.removePriceLine(l));
   const style = { entry: ["כניסה", cssVar("--accent")], tp: ["TP", cssVar("--up")], sl: ["SL", cssVar("--down")] };
   priceLines = d.levels.filter((l) => l.price).map((l) => candles.createPriceLine({
@@ -315,11 +357,17 @@ const SETTINGS = [
     ["sl_outside_rth", "Stop Loss גם מחוץ לשעות המסחר", "checkbox", "לא מומלץ: נזילות נמוכה"],
   ]],
   ["אסטרטגיית כניסה תוך-יומית", [
-    ["strategy", "אסטרטגיה", "select", ""],
+    ["strategy", "אסטרטגיה", "select", "ברירת המחדל: קו ה-MACD חוצה מעל קו ה-Signal כששניהם מתחת לאפס"],
+    ["macd_fast", "MACD – Fast length", "number", ""],
+    ["macd_slow", "MACD – Slow length", "number", ""],
+    ["macd_signal", "MACD – Signal length", "number", ""],
+    ["macd_min_depth_pct", "עומק מינימלי של ה-MACD מתחת לאפס", "number", "באחוזים ממחיר המניה, נמדד בשפל הירידה של היום. 0 = כל חיתוך מתחת לאפס"],
+    ["use_extended_bars", "לכלול נרות מסחר מורחב בחישוב", "checkbox", "כמו גרף עם Extended Hours ב-TradingView"],
+  ]],
+  ["אסטרטגיות חלופיות (ma_cross / ma_trend)", [
     ["ma_type", "סוג ממוצע נע", "select:EMA,SMA", ""],
     ["ma_fast", "ממוצע מהיר (נרות דקה)", "number", ""],
     ["ma_slow", "ממוצע איטי (נרות דקה)", "number", ""],
-    ["use_extended_bars", "לכלול נרות מסחר מורחב בחישוב", "checkbox", ""],
   ]],
 ];
 

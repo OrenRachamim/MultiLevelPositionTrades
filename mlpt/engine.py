@@ -32,7 +32,7 @@ from .models import (CANCELLED, CLOSED, ENTERING, HOLDING_STATES, INTRADAY, O_LO
                      W_ENTERED, W_NO_SIGNAL, W_SKIPPED, W_WATCHING, AccountSnapshot, Bar,
                      Execution, OrderRequest, OrderUpdate, round_price)
 from .notifier import Notifier
-from .strategy import STRATEGIES, Signal, moving_average
+from .strategy import STRATEGIES, Signal, macd, moving_average
 from .watchlist import PARAM_COLS, parse_watchlist
 
 log = logging.getLogger("mlpt.engine")
@@ -887,12 +887,12 @@ class Engine:
         return [self.position_view(p) for p in rows]
 
     def chart(self, symbol: str, trade_date: str) -> dict[str, Any]:
-        """Bars, moving averages and trade markers of one stock for one ET date."""
+        """Bars, moving averages, MACD and trade markers of one stock for one ET date."""
         st = self.settings
         day = dt.date.fromisoformat(trade_date)
         start = int(dt.datetime.combine(day, dt.time(0), tzinfo=ET).timestamp())
         end = int(dt.datetime.combine(day + dt.timedelta(days=1), dt.time(0), tzinfo=ET).timestamp())
-        warm = self.store.bars(symbol, start - 6 * 86400, start)[-(st.ma_slow * 4 + 50):]
+        warm = self.store.bars(symbol, start - 6 * 86400, start)[-600:]
         bars = self.store.bars(symbol, start, end)
         live = self.live.get(symbol)
         if live is not None and start <= live.ts < end and (not bars or live.ts > bars[-1].ts):
@@ -903,12 +903,20 @@ class Engine:
 
         src = [b for b in warm + bars if b.rth or st.use_extended_bars]
         closes = [b.close for b in src]
-        fast = moving_average(closes, st.ma_fast, st.ma_type)
-        slow = moving_average(closes, st.ma_slow, st.ma_type)
-        ma_fast = [{"time": shift(b.ts), "value": round(v, 4)} for b, v in zip(src, fast)
-                   if v is not None and b.ts >= start]
-        ma_slow = [{"time": shift(b.ts), "value": round(v, 4)} for b, v in zip(src, slow)
-                   if v is not None and b.ts >= start]
+        # the price overlay shows the averages the active strategy is built on
+        if st.strategy.startswith("macd"):
+            fast_n, slow_n, kind = st.macd_fast, st.macd_slow, "EMA"
+        else:
+            fast_n, slow_n, kind = st.ma_fast, st.ma_slow, st.ma_type
+        fast = moving_average(closes, fast_n, kind)
+        slow = moving_average(closes, slow_n, kind)
+        m_line, m_sig, m_hist = macd(closes, st.macd_fast, st.macd_slow, st.macd_signal)
+
+        def points(values: list[Optional[float]]) -> list[dict[str, Any]]:
+            return [{"time": shift(b.ts), "value": round(v, 5)} for b, v in zip(src, values)
+                    if v is not None and b.ts >= start]
+
+        ma_fast, ma_slow = points(fast), points(slow)
 
         markers, levels = [], []
         for p in self.store.pos_for_symbol(symbol, start, end):
@@ -928,6 +936,8 @@ class Engine:
             "bars": [{"time": shift(b.ts), "open": b.open, "high": b.high, "low": b.low,
                       "close": b.close, "volume": b.volume, "rth": b.rth} for b in bars],
             "ma_fast": ma_fast, "ma_slow": ma_slow,
-            "ma_labels": [f"{st.ma_type}{st.ma_fast}", f"{st.ma_type}{st.ma_slow}"],
+            "ma_labels": [f"{kind}{fast_n}", f"{kind}{slow_n}"],
+            "macd": points(m_line), "macd_signal": points(m_sig), "macd_hist": points(m_hist),
+            "macd_label": f"MACD {st.macd_fast}/{st.macd_slow}/{st.macd_signal}",
             "markers": sorted(markers, key=lambda m: m["time"]), "levels": levels,
         }
