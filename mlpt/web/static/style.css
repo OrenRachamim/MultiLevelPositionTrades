@@ -150,6 +150,12 @@ table.doc { width: auto; margin-top: 6px; }
 .field input, .field select { width: 100%; direction: ltr; }
 
 /* chart */
+.chart-wrap { position: relative; }
+.chart-empty {
+  position: absolute; inset: 0; z-index: 3; display: flex; align-items: center; justify-content: center;
+  padding: 20px; text-align: center; font-size: 16px; color: var(--text-2); background: var(--surface);
+}
+.chart-empty[hidden] { display: none; }
 #chart { height: 440px; }
 #chart-macd { height: 190px; }
 #macd-legend { margin-top: 6px; }

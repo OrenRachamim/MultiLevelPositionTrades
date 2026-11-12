@@ -158,6 +158,17 @@ document.addEventListener("click", async (e) => {
 // --------------------------------------------------------------------- charts
 let chart = null, candles = null, maFast = null, maSlow = null, priceLines = [], chartKey = "", lastChart = null;
 let macdChart = null, macdHist = null, macdLine = null, macdSignal = null;
+let chartSeq = 0, chartHadData = false;
+
+// Fit both panes to the data on screen. Dragging a price axis switches the chart
+// library to a manual scale, which would otherwise survive a change of stock and
+// leave e.g. a $40 stock off-screen on the $400 scale of the previous one.
+function resetChartView() {
+  if (!chart) return;
+  for (const ch of [chart, macdChart]) ch.priceScale("right").applyOptions({ autoScale: true });
+  chart.timeScale().fitContent();
+  macdChart.timeScale().fitContent();
+}
 const cssVar = (n) => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
 
 function ensureChart() {
@@ -226,16 +237,20 @@ function renderLegend(time) {
 }
 
 async function loadCharts() {
+  const seq = ++chartSeq;          // a newer request (click or timer) makes this one stale
   const dateInput = $("#chart-date");
   if (!state.chartDate) state.chartDate = state.status.today;
   if (dateInput.value !== state.chartDate) dateInput.value = state.chartDate;
   const sy = await api(`/api/symbols?date=${state.chartDate}`);
-  if (!state.chartSymbol || (!sy.symbols.includes(state.chartSymbol) && sy.symbols.length)) state.chartSymbol = sy.symbols[0] || null;
+  if (seq !== chartSeq) return;
+  if (!sy.symbols.includes(state.chartSymbol)) state.chartSymbol = sy.symbols[0] || null;
   $("#chart-symbols").innerHTML = sy.symbols.map((s) => `<button data-sym="${esc(s)}" class="${s === state.chartSymbol ? "active" : ""}">${esc(s)}</button>`).join("")
     || '<span class="muted">אין מניות לתאריך הזה</span>';
-  if (!state.chartSymbol) { $("#chart-empty").hidden = false; return; }
-  const d = await api(`/api/chart?symbol=${encodeURIComponent(state.chartSymbol)}&date=${state.chartDate}`);
   ensureChart();
+  const d = state.chartSymbol
+    ? await api(`/api/chart?symbol=${encodeURIComponent(state.chartSymbol)}&date=${state.chartDate}`)
+    : { symbol: "", date: state.chartDate, bars: [], ma_fast: [], ma_slow: [], macd: [], macd_signal: [], macd_hist: [], markers: [], levels: [], ma_labels: ["", ""], macd_label: "MACD" };
+  if (seq !== chartSeq) return;
   const ext = $("#chart-ext").checked, extColor = cssVar("--ext");
   const bars = d.bars.filter((b) => ext || b.rth).map((b) => b.rth ? b
     : { ...b, color: b.close >= b.open ? cssVar("--surface") : extColor, borderColor: extColor, wickColor: extColor });
@@ -265,15 +280,28 @@ async function loadCharts() {
   const style = { entry: ["כניסה", cssVar("--accent")], tp: ["TP", cssVar("--up")], sl: ["SL", cssVar("--down")] };
   priceLines = d.levels.filter((l) => l.price).map((l) => candles.createPriceLine({
     price: l.price, color: style[l.kind][1], lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dashed, axisLabelVisible: true, title: style[l.kind][0] }));
-  $("#key-fast").textContent = d.ma_labels[0];
-  $("#key-slow").textContent = d.ma_labels[1];
-  $("#chart-empty").hidden = bars.length > 0;
+  if (d.ma_labels[0]) { $("#key-fast").textContent = d.ma_labels[0]; $("#key-slow").textContent = d.ma_labels[1]; }
+  const empty = $("#chart-empty");
+  empty.hidden = bars.length > 0;
+  if (!bars.length) {
+    const hidden = d.bars.length - bars.length;
+    empty.textContent = !d.symbol ? `אין מניות עם נתונים בתאריך ${d.date}`
+      : hidden ? `ל-${d.symbol} יש בתאריך ${d.date} רק נרות מסחר מורחב (${hidden}) – סמן "מסחר מורחב" כדי לראות אותם`
+      : `אין נרות ל-${d.symbol} בתאריך ${d.date}`;
+  }
+  const last = bars[bars.length - 1];
+  $("#chart-info").textContent = bars.length
+    ? `${bars.length} נרות · אחרון ${new Date(last.time * 1000).toISOString().slice(11, 16)} · ${last.close.toFixed(2)}` : "";
+  // a new stock, date or bar set - or the first bars of an empty chart - always gets a fresh view
   const key = `${d.symbol}|${d.date}|${ext}`;
-  if (key !== chartKey) { chartKey = key; chart.timeScale().fitContent(); }
+  if (key !== chartKey || (bars.length > 0 && !chartHadData)) { chartKey = key; resetChartView(); }
+  chartHadData = bars.length > 0;
   renderLegend(null);
 }
-$("#chart-symbols").addEventListener("click", (e) => { const b = e.target.closest("button"); if (b) { state.chartSymbol = b.dataset.sym; loadCharts(); } });
-$("#chart-date").addEventListener("change", (e) => { state.chartDate = e.target.value || null; loadCharts(); });
+$("#chart-reset").addEventListener("click", resetChartView);
+// choosing a stock or a date - even the one already shown - always re-fits the view
+$("#chart-symbols").addEventListener("click", (e) => { const b = e.target.closest("button"); if (b) { state.chartSymbol = b.dataset.sym; chartKey = ""; loadCharts(); } });
+$("#chart-date").addEventListener("change", (e) => { state.chartDate = e.target.value || null; chartKey = ""; loadCharts(); });
 $("#chart-ext").addEventListener("change", loadCharts);
 
 // ----------------------------------------------------------------- daily list

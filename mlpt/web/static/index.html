@@ -60,11 +60,16 @@
         <label>תאריך <input type="date" id="chart-date"></label>
         <div id="chart-symbols" class="chips"></div>
         <label class="check"><input type="checkbox" id="chart-ext" checked> מסחר מורחב (לפני/אחרי)</label>
+        <button id="chart-reset" class="btn small ghost" title="התאמת הצירים לכל הנרות של היום">התאם תצוגה</button>
+        <span id="chart-info" class="muted"></span>
       </div>
-      <div id="chart-legend" class="legend" dir="ltr"></div>
-      <div id="chart" dir="ltr"></div>
-      <div id="macd-legend" class="legend" dir="ltr"></div>
-      <div id="chart-macd" dir="ltr"></div>
+      <div class="chart-wrap">
+        <div id="chart-legend" class="legend" dir="ltr"></div>
+        <div id="chart" dir="ltr"></div>
+        <div id="macd-legend" class="legend" dir="ltr"></div>
+        <div id="chart-macd" dir="ltr"></div>
+        <div id="chart-empty" class="chart-empty" hidden></div>
+      </div>
       <div class="chart-key">
         <span><i class="key up"></i> נר עולה (חלול)</span>
         <span><i class="key down"></i> נר יורד (מלא)</span>
@@ -76,7 +81,6 @@
         <span>קווים מקווקווים: כניסה / TP / SL של פוזיציה פתוחה</span>
         <span class="muted">הזמנים בשעון ניו יורק</span>
       </div>
-      <p id="chart-empty" class="muted" hidden>אין נרות לתאריך ולמניה שנבחרו.</p>
     </div>
   </section>
 
