@@ -253,3 +253,49 @@ def test_sim_fill_rules():
     assert seen[day].status == O_CANCELLED                                 # DAY order expired at the close
     sim.advance(ts(dt.date(2026, 11, 11), 9, 0))
     assert sim.account().available == pytest.approx(sim.cash)              # settled the next day
+
+
+# ------------------------------------------------------------------ backtest
+def test_historical_lists_file(tmp_path):
+    from mlpt.runner import read_lists
+    f = tmp_path / "lists.csv"
+    f.write_text("\ufeffdate,symbol,intraday_tp_pct\n2026-11-10,AAPL,0.4\n2026-11-10,MSFT,\n2026-11-11,NVDA,0.6\n",
+                 encoding="utf-8")
+    lists = read_lists(str(f))
+    assert sorted(lists) == ["2026-11-10", "2026-11-11"]
+    rows = parse_watchlist(lists["2026-11-10"]).rows
+    assert [(r.symbol, r.intraday_tp_pct) for r in rows] == [("AAPL", 0.4), ("MSFT", None)]
+    bad = tmp_path / "bad.csv"
+    bad.write_text("symbol\nAAPL\n")
+    with pytest.raises(SystemExit):
+        read_lists(str(bad))
+
+
+def test_backtest_over_stored_bars(tmp_path):
+    import asyncio
+    import logging
+    from mlpt import runner
+    from mlpt.db import Store
+
+    src = Store(tmp_path / "mlpt_paper.db")
+    for day in (D1, dt.date(2026, 11, 11)):
+        bars = day_bars(day, [100.0] * 5 + [100.0, 100.0, 100.3, 100.7, 100.2] + [100.2] * 5, start=(9, 40))
+        bars[5].volume = 777                                             # the test strategy's entry signal
+        for b in bars:
+            b.high, b.low = b.close + 0.05, b.close - 0.05
+        src.save_bars("AAPL", bars)
+    src.close()
+    handlers = logging.getLogger().handlers[:]
+    try:
+        run = lambda **kw: asyncio.run(runner.run_sim(                  # noqa: E731
+            Config(data_dir=str(tmp_path)), "replay", first=D1, last=dt.date(2026, 11, 11), symbols=["AAPL"],
+            web=False, quiet=True, trades=False, **kw))
+        plain = run(overrides={"strategy": "flag"})
+        trail = run(overrides={"strategy": "flag", "intraday_trail_pct": 0.2})
+    finally:
+        logging.getLogger().handlers[:] = handlers
+    assert (plain["listed"], plain["trades"], plain["closed"], plain["wins"]) == (2, 2, 2, 2)
+    assert list(plain["by_exit"]) == ["INTRADAY TP"] and plain["by_exit"]["INTRADAY TP"][0] == 2
+    assert list(trail["by_exit"]) == ["INTRADAY TRAIL"] and trail["closed"] == 2
+    assert plain["total"] == pytest.approx(plain["realized"]) and plain["commission"] == 4.0
+    assert "TOTAL" in runner.format_stats(plain)

@@ -182,3 +182,39 @@ def test_bar_stream_emits_each_completed_bar_once(broker: IBBroker):
     assert [(o[0] - int(t0.timestamp())) // 60 for o in out] == [2, 5] and [o[2] for o in out] == [True, False]
     broker._on_bars("AAPL", BarDataList([mk(9, 1.0)]), True)       # stale subscription object: ignored
     assert len(out) == 2
+
+
+def test_history_download_walks_back_in_chunks(broker: IBBroker, monkeypatch):
+    import asyncio
+
+    broker._contracts["AAPL"] = Stock("AAPL", "SMART", "USD")
+    calls = []
+
+    async def fake_history(contract, endDateTime, durationStr, barSizeSetting, whatToShow, useRTH, formatDate,
+                           keepUpToDate, timeout):
+        calls.append((endDateTime, durationStr))
+        assert (barSizeSetting, whatToShow, useRTH, formatDate, keepUpToDate) == ("1 min", "TRADES", False, 2, False)
+        days = int(durationStr.split()[0])
+        if len(calls) == 2:
+            return BarDataList()                                    # e.g. a long request is refused once
+        first = endDateTime - dt.timedelta(days=days)
+        out, t = BarDataList(), first.replace(minute=0, second=0, microsecond=0)
+        while t < endDateTime:                                      # one bar per hour is enough here
+            out.append(BarData(date=t, open=1, high=1, low=1, close=float(t.day), volume=1))
+            t += dt.timedelta(hours=1)
+        return out
+
+    monkeypatch.setattr(broker.ib, "reqHistoricalDataAsync", fake_history)
+    bars = asyncio.run(broker.fetch_history("AAPL", dt.date(2026, 11, 2), dt.date(2026, 11, 10), pause=0))
+    stamps = [b.ts for b in bars]
+    assert stamps == sorted(set(stamps))                             # ordered, no duplicates
+    lo = dt.datetime(2026, 11, 2, 5, tzinfo=dt.timezone.utc).timestamp()      # midnight in New York (EST)
+    hi = dt.datetime(2026, 11, 11, 5, tzinfo=dt.timezone.utc).timestamp()
+    assert stamps[0] == lo and stamps[-1] == hi - 3600 and len(stamps) == 9 * 24
+    assert calls[0][1] == "5 D" and calls[2][1] == "1 D"             # fell back to short requests
+
+    async def nothing(*a, **k):
+        return BarDataList()
+
+    monkeypatch.setattr(broker.ib, "reqHistoricalDataAsync", nothing)
+    assert asyncio.run(broker.fetch_history("AAPL", dt.date(2026, 11, 2), dt.date(2026, 11, 10), pause=0)) == []

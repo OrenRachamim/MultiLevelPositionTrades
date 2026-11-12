@@ -25,7 +25,7 @@ DEMO_SYMBOLS = {"AAPL": 228.0, "MSFT": 512.0, "NVDA": 141.0, "AMZN": 214.0, "MET
                 "GOOGL": 187.0, "TSLA": 342.0, "AMD": 158.0, "NFLX": 97.0, "AVGO": 262.0}
 
 
-def setup_logging(cfg: Config) -> None:
+def setup_logging(cfg: Config, quiet: bool = False) -> None:
     logs = Path(cfg.data_dir) / "logs"
     logs.mkdir(parents=True, exist_ok=True)
     fmt = logging.Formatter("%(asctime)s %(levelname)-7s %(name)s: %(message)s")
@@ -34,6 +34,7 @@ def setup_logging(cfg: Config) -> None:
     file.setFormatter(fmt)
     console = logging.StreamHandler()
     console.setFormatter(fmt)
+    console.setLevel(logging.ERROR if quiet else logging.INFO)     # the file always gets everything
     root = logging.getLogger()
     root.setLevel(logging.INFO)
     root.handlers[:] = [file, console]
@@ -129,25 +130,95 @@ def demo_steps(calendar: MarketCalendar, engine: Engine, sim: SimBroker, first: 
         day, n = calendar.next_trading_day(day), n + 1
 
 
-def replay_steps(calendar: MarketCalendar, engine: Engine, sim: SimBroker, source: Store,
-                 first: dt.date, days: int) -> Iterator[Step]:
-    def day_range(d: dt.date) -> tuple[int, int]:
-        return (int(dt.datetime.combine(d, dt.time(0), tzinfo=ET).timestamp()),
-                int(dt.datetime.combine(d + dt.timedelta(days=1), dt.time(0), tzinfo=ET).timestamp()))
+def day_range(d: dt.date) -> tuple[int, int]:
+    """Epoch range of the New York calendar day ``d``."""
+    return (int(dt.datetime.combine(d, dt.time(0), tzinfo=ET).timestamp()),
+            int(dt.datetime.combine(d + dt.timedelta(days=1), dt.time(0), tzinfo=ET).timestamp()))
 
+
+def replay_steps(calendar: MarketCalendar, engine: Engine, sim: SimBroker, source: Store,
+                 first: dt.date, days: int, symbols: Optional[list[str]] = None,
+                 lists: Optional[dict[str, str]] = None) -> Iterator[Step]:
+    """Recorded bars day by day. The daily list comes from ``lists`` (date -> CSV text),
+    else ``symbols`` (the same stocks every day), else the lists stored for those days."""
     start = day_range(first)[0]
     for sym in source.bar_symbols(start - 6 * 86400, start):
         sim.history[sym] = source.bars(sym, start - 6 * 86400, start)
     day = first
     for _ in range(days):
         lo, hi = day_range(day)
-        for w in source.watch_for_date(day.isoformat()):
-            engine.store.watch_add(day.isoformat(), {"symbol": w["symbol"], **{c: w[c] for c in PARAM_COLS}})
+        if lists is not None:
+            if day.isoformat() in lists:
+                res = engine.load_watchlist(day.isoformat(), lists[day.isoformat()])
+                if not res["ok"]:
+                    raise SystemExit(f"list for {day}: {'; '.join(res['errors'])}")
+        elif symbols:
+            engine.load_watchlist(day.isoformat(), "symbol\n" + "\n".join(symbols))
+        else:
+            for w in source.watch_for_date(day.isoformat()):
+                engine.store.watch_add(day.isoformat(), {"symbol": w["symbol"], **{c: w[c] for c in PARAM_COLS}})
         bars = {sym: source.bars(sym, lo, hi) for sym in source.bar_symbols(lo, hi)}
         if not bars:
             log.warning("no recorded bars for %s", day)
         yield from recorded_day(calendar, day, bars)
         day = calendar.next_trading_day(day)
+
+
+def read_lists(path: str) -> dict[str, str]:
+    """A CSV of historical daily lists (a ``date`` column + the normal list columns) -> date -> CSV text."""
+    import csv
+
+    with open(path, newline="", encoding="utf-8-sig") as f:
+        rows = list(csv.DictReader(f))
+    if not rows or "date" not in rows[0] or "symbol" not in rows[0]:
+        raise SystemExit(f"{path}: need a header row with at least the columns date,symbol")
+    cols = [c for c in rows[0] if c and c != "date"]
+    out: dict[str, list[str]] = {}
+    for r in rows:
+        try:
+            day = dt.date.fromisoformat((r["date"] or "").strip()).isoformat()
+        except ValueError:
+            raise SystemExit(f"{path}: bad date {r['date']!r}, expected YYYY-MM-DD") from None
+        out.setdefault(day, [",".join(cols)]).append(",".join((r[c] or "").strip() for c in cols))
+    return {day: "\n".join(lines) for day, lines in out.items()}
+
+
+def stats(store: Store, sim: SimBroker) -> dict[str, Any]:
+    """Result of a simulated run, open positions marked at the last price."""
+    rows = store._all("SELECT * FROM positions WHERE state != 'CANCELLED' ORDER BY id")
+    closed = [r for r in rows if r["state"] == "CLOSED"]
+    still = [r for r in rows if r["state"] != "CLOSED"]
+    wins = [r["pnl"] for r in closed if r["pnl"] > 0]
+    losses = [r["pnl"] for r in closed if r["pnl"] <= 0]
+    by: dict[str, list[float]] = {}
+    for r in closed:
+        by.setdefault(f"{r['exit_phase']} {r['exit_reason']}", []).append(r["pnl"])
+    unrealized = sum((sim.last.get(r["symbol"], r["entry_price"]) - r["entry_price"]) * r["qty_open"] for r in still)
+    listed = store._all("SELECT status, COUNT(*) n FROM watchlist GROUP BY status")
+    realized = sum(r["pnl"] for r in closed)
+    return {
+        "listed": sum(x["n"] for x in listed), "no_signal": sum(x["n"] for x in listed if x["status"] == "NO_SIGNAL"),
+        "skipped": sum(x["n"] for x in listed if x["status"] == "SKIPPED"),
+        "trades": len(rows), "closed": len(closed), "wins": len(wins),
+        "win_rate": len(wins) / len(closed) * 100 if closed else 0.0,
+        "avg_win": sum(wins) / len(wins) if wins else 0.0, "avg_loss": sum(losses) / len(losses) if losses else 0.0,
+        "realized": realized, "open": len(still), "unrealized": unrealized, "total": realized + unrealized,
+        "commission": sum(r["commission"] or 0 for r in rows),
+        "by_exit": {k: (len(v), sum(v)) for k, v in sorted(by.items())},
+    }
+
+
+def format_stats(s: dict[str, Any]) -> str:
+    lines = [
+        f"stocks on the lists {s['listed']} | no signal {s['no_signal']} | skipped {s['skipped']} | entries {s['trades']}",
+        f"closed {s['closed']} | winners {s['wins']} ({s['win_rate']:.0f}%) | avg win {s['avg_win']:+.2f} | "
+        f"avg loss {s['avg_loss']:+.2f}",
+    ]
+    for k, (n, pnl) in s["by_exit"].items():
+        lines.append(f"  {k:16} {n:>4} trades {pnl:>+11.2f}")
+    lines.append(f"realized {s['realized']:+.2f} | still open {s['open']} (marked {s['unrealized']:+.2f}) | "
+                 f"TOTAL {s['total']:+.2f} after {s['commission']:.2f} commissions")
+    return "\n".join(lines)
 
 
 async def _drive(sim: SimBroker, engine: Engine, steps: Iterator[Step], speed: float) -> None:
@@ -179,9 +250,12 @@ def summary(store: Store) -> str:
 
 async def run_sim(cfg: Config, kind: str, *, first: Optional[dt.date] = None, days: int = 1,
                   speed: float = 240.0, cash: float = 100_000.0, source_mode: str = "paper",
-                  overrides: Optional[dict[str, Any]] = None, web: bool = True, seed: int = 7) -> None:
+                  overrides: Optional[dict[str, Any]] = None, web: bool = True, seed: int = 7,
+                  last: Optional[dt.date] = None, symbols: Optional[list[str]] = None,
+                  lists: Optional[dict[str, str]] = None, quiet: bool = False,
+                  trades: bool = True) -> Optional[dict[str, Any]]:
     cfg.mode = "sim"
-    setup_logging(cfg)
+    setup_logging(cfg, quiet)
     calendar = calendar_from(cfg)
     source: Optional[Store] = None
     if kind == "replay":
@@ -206,21 +280,107 @@ async def run_sim(cfg: Config, kind: str, *, first: Optional[dt.date] = None, da
     engine = Engine(store, sim, calendar, Notifier("[SIM] "), sim.now, "sim")
     engine.event("INFO", "SYSTEM", "סימולציה עם מחירים אקראיים (Demo)" if kind == "demo"
                  else f"הרצה חוזרת (Replay) של {first} מתוך נתוני {source_mode}")
+    if last is not None:
+        if last < first:
+            raise SystemExit("--to is before --from")
+        days = 1 + calendar.trading_days_between(first, last)
     steps = (demo_steps(calendar, engine, sim, first, days, seed) if kind == "demo"
-             else replay_steps(calendar, engine, sim, source, first, days))   # type: ignore[arg-type]
+             else replay_steps(calendar, engine, sim, source, first, days, symbols, lists))   # type: ignore[arg-type]
 
     if not web:
         await _drive(sim, engine, steps, 0)
-        print(summary(store))
-        return
+        result = stats(store, sim)
+        if trades:
+            print(summary(store))
+        print(format_stats(result))
+        return result
 
     async def drive_then_idle() -> None:
         await _drive(sim, engine, steps, speed)
         print(summary(store))
+        print(format_stats(stats(store, sim)))
         while True:           # keep the dashboard up for inspection
             await asyncio.sleep(3600)
 
     await _supervise([asyncio.ensure_future(c) for c in (drive_then_idle(), _serve(engine, cfg))])
+    return None
+
+
+async def run_backtest(cfg: Config, *, first: dt.date, last: dt.date, source_mode: str, cash: float,
+                       overrides: dict[str, Any], vary: Optional[tuple[str, list[str]]],
+                       symbols: Optional[list[str]], lists: Optional[dict[str, str]], web: bool) -> None:
+    """Run the strategy over recorded / downloaded bars; optionally once per value of one setting."""
+    common: dict[str, Any] = dict(first=first, last=last, source_mode=source_mode, cash=cash,
+                                  symbols=symbols, lists=lists)
+    if vary is None:
+        await run_sim(cfg, "replay", overrides=overrides, web=web, speed=0, quiet=True, **common)
+        return
+    key, values = vary
+    results = []
+    for v in values:
+        print(f"\n===== {key} = {v} =====")
+        results.append((v, await run_sim(cfg, "replay", overrides={**overrides, key: v}, web=False,
+                                         quiet=True, trades=False, **common)))
+    print(f"\n{key:>22} {'entries':>8} {'closed':>7} {'win %':>6} {'realized':>11} {'open':>5} {'TOTAL':>11}")
+    for v, r in results:
+        print(f"{v:>22} {r['trades']:>8} {r['closed']:>7} {r['win_rate']:>6.0f} {r['realized']:>+11.2f} "
+              f"{r['open']:>5} {r['total']:>+11.2f}")
+    print("(the dashboard database data/mlpt_sim.db holds the last run)")
+
+
+# --------------------------------------------------------------- download ---
+async def run_download(cfg: Config, symbols: list[str], first: dt.date, last: dt.date, force: bool = False) -> int:
+    """Download one-minute history from IB into the database of the configured mode."""
+    from .broker.ib import IBBroker
+
+    logging.basicConfig(level=logging.WARNING)
+    calendar = calendar_from(cfg)
+    store = Store(cfg.db_path)
+    days = [d for d in (first + dt.timedelta(days=i) for i in range((last - first).days + 1))
+            if calendar.is_trading_day(d)]
+    if not symbols:      # default: every stock that was on a daily list in the range
+        symbols = sorted({w["symbol"] for d in days for w in store.watch_for_date(d.isoformat())})
+    if not symbols or not days:
+        print("nothing to download: give --symbols, or load daily lists for these dates first")
+        return 1
+    cfg.ib.client_id += 1                # do not collide with a running trading process
+    broker = IBBroker(cfg.ib, cfg.mode, calendar)
+    broker.on_error = lambda msg, sym=None: print(f"  ! {sym or ''} {msg}")
+    task = asyncio.ensure_future(broker.run())
+    try:
+        print(f"connecting to IB Gateway {cfg.ib.host}:{cfg.ib.port} ...")
+        for _ in range(60):
+            if broker.connected or broker.fatal:
+                break
+            await asyncio.sleep(0.5)
+        if not broker.connected:
+            print("FAILED - is IB Gateway running and logged in?")
+            return 1
+        print(f"{len(symbols)} stocks, {len(days)} trading days ({days[0]} .. {days[-1]}) -> {cfg.db_path}")
+        problems = 0
+        for sym in symbols:
+            have = sum(1 for d in days if sum(1 for b in store.bars(sym, *day_range(d)) if b.rth) >= 200)
+            if have == len(days) and not force:
+                print(f"  {sym:8} already complete")
+                continue
+            try:
+                bars = await broker.fetch_history(sym, days[0], days[-1])
+            except Exception as e:
+                print(f"  {sym:8} FAILED: {e}")
+                problems += 1
+                continue
+            for b in bars:
+                b.rth = calendar.is_rth_ts(b.ts)
+            store.save_bars(sym, bars)
+            got = len({to_et(b.ts).date() for b in bars if b.rth})
+            print(f"  {sym:8} {len(bars):>7} bars, {got}/{len(days)} days" + ("" if got == len(days) else "  <- incomplete"))
+            problems += got < len(days)
+        print("done" if not problems else f"done with {problems} incomplete stocks")
+        return 0 if not problems else 1
+    finally:
+        task.cancel()
+        await broker.stop()
+        store.close()
 
 
 # ------------------------------------------------------------------ check ---

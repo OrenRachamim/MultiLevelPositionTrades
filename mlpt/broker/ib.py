@@ -223,6 +223,52 @@ class IBBroker(Broker):
         self.on_bar(symbol, self._bar(bars[-1]), False)
         bars.updateEvent += lambda b, has_new, s=symbol: self._on_bars(s, b, has_new)
 
+    async def fetch_history(self, symbol: str, start: dt.date, end: dt.date, chunk_days: int = 5,
+                            pause: float = 1.5) -> list[Bar]:
+        """One-minute bars (regular + extended hours) for every day from ``start`` to ``end``.
+
+        IB serves intraday history in chunks, walking backwards from an end time.
+        """
+        from ..market_calendar import ET
+
+        contract = await self._contract(symbol)
+        lo = int(dt.datetime.combine(start, dt.time(0), tzinfo=ET).timestamp())
+        hi = int(dt.datetime.combine(end + dt.timedelta(days=1), dt.time(0), tzinfo=ET).timestamp())
+        cursor = dt.datetime.fromtimestamp(hi, dt.timezone.utc)
+        found: dict[int, Bar] = {}
+        failures = 0
+        while cursor.timestamp() > lo:
+            try:
+                chunk = await self.ib.reqHistoricalDataAsync(
+                    contract, endDateTime=cursor, durationStr=f"{chunk_days} D", barSizeSetting="1 min",
+                    whatToShow="TRADES", useRTH=False, formatDate=2, keepUpToDate=False, timeout=120)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                chunk = None
+                log.warning("history request for %s failed: %s", symbol, e)
+            if not chunk:
+                failures += 1
+                if failures > 3:
+                    break                       # nothing (more) available for this stock
+                if chunk_days > 1:
+                    chunk_days = 1              # some accounts only serve short requests
+                else:                           # an empty day (holiday, halt) or pacing: step back and wait
+                    cursor -= dt.timedelta(days=1)
+                    await asyncio.sleep(pause * 4)
+                continue
+            failures = 0
+            bars = [self._bar(b) for b in chunk]
+            for b in bars:
+                if lo <= b.ts < hi:
+                    found[b.ts] = b
+            earliest = dt.datetime.fromtimestamp(bars[0].ts, dt.timezone.utc)
+            if earliest >= cursor:
+                break                           # no progress: avoid looping forever
+            cursor = earliest
+            await asyncio.sleep(pause)          # stay well inside IB's request pacing
+        return [found[t] for t in sorted(found)]
+
     @staticmethod
     def _bar(b: Any) -> Bar:
         return Bar(_bar_ts(b.date), b.open, b.high, b.low, b.close, float(b.volume or 0))
