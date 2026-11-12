@@ -75,3 +75,28 @@ def test_password_protection(rig: Rig):
     assert c.get("/").status_code == 401
     assert c.get("/api/status", auth=("admin", "wrong")).status_code == 401
     assert c.get("/api/status", auth=("admin", "s3cret")).status_code == 200
+
+
+def test_assets_are_versioned_so_updates_are_never_half_loaded(rig: Rig):
+    c = client(rig)
+    page = c.get("/")
+    version = c.get("/api/status").json()["assets"]
+    assert page.headers["cache-control"] == "no-store"
+    for name in ("style.css", "app.js", "vendor/lightweight-charts.js"):
+        assert f'"/static/{name}?v={version}"' in page.text
+        assert c.get(f"/static/{name}?v={version}").status_code == 200
+
+
+def test_chart_reports_why_macd_is_empty(rig: Rig):
+    c = client(rig)
+    c.post("/api/watchlist", json={"date": D1.isoformat(), "text": "AAPL"}, headers=H)
+    rig.engine.tick()
+    rig.step(ts(D1, 8, 0), "AAPL", 100.0)                                  # pre-market bars only
+    rig.step(ts(D1, 8, 1), "AAPL", 100.1)
+    chart = c.get(f"/api/chart?symbol=AAPL&date={D1}").json()
+    assert len(chart["bars"]) == 2 and chart["macd"] == [] and chart["indicator_bars"] == 0
+    assert chart["macd_need"] == 34 and chart["uses_extended"] is False
+    rig.run("AAPL", D1, (9, 30), [100.0 + 0.01 * i for i in range(40)])
+    chart = c.get(f"/api/chart?symbol=AAPL&date={D1}").json()
+    assert chart["indicator_bars"] == 40 and len(chart["macd"]) == 15      # line from bar 26
+    assert len(chart["macd_signal"]) == 7 and len(chart["macd_hist"]) == 7  # signal from bar 34

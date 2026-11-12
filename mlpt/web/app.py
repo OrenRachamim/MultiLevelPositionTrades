@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -41,6 +41,11 @@ class TradingIn(BaseModel):
     enabled: bool
 
 
+def asset_version() -> str:
+    """Changes whenever a dashboard file changes (after an update)."""
+    return str(int(max(p.stat().st_mtime for p in STATIC.rglob("*") if p.is_file())))
+
+
 def create_app(engine: Engine, cfg: Config) -> FastAPI:
     security = HTTPBasic(auto_error=False)
 
@@ -70,12 +75,17 @@ def create_app(engine: Engine, cfg: Config) -> FastAPI:
     app.mount("/static", StaticFiles(directory=STATIC), name="static")
 
     @app.get("/")
-    def index() -> FileResponse:
-        return FileResponse(STATIC / "index.html", headers={"Cache-Control": "no-cache"})
+    def index() -> HTMLResponse:
+        # every asset URL carries the version, so an updated page never runs a cached old script
+        v = asset_version()
+        html = (STATIC / "index.html").read_text(encoding="utf-8")
+        for name in ("style.css", "app.js", "vendor/lightweight-charts.js"):
+            html = html.replace(f'"/static/{name}"', f'"/static/{name}?v={v}"')
+        return HTMLResponse(html, headers={"Cache-Control": "no-store"})
 
     @app.get("/api/status")
     def status() -> dict[str, Any]:
-        return {**engine.status(), "version": __version__,
+        return {**engine.status(), "version": __version__, "assets": asset_version(),
                 "telegram": isinstance(engine.notifier, TelegramNotifier),
                 "fatal": getattr(engine.broker, "fatal", None)}
 

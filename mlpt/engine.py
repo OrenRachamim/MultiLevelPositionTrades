@@ -939,5 +939,8 @@ class Engine:
             "ma_labels": [f"{kind}{fast_n}", f"{kind}{slow_n}"],
             "macd": points(m_line), "macd_signal": points(m_sig), "macd_hist": points(m_hist),
             "macd_label": f"MACD {st.macd_fast}/{st.macd_slow}/{st.macd_signal}",
+            "macd_need": st.macd_slow + st.macd_signal - 1,     # bars before the first signal value
+            "indicator_bars": sum(1 for b in src if b.ts >= start),
+            "uses_extended": st.use_extended_bars,
             "markers": sorted(markers, key=lambda m: m["time"]), "levels": levels,
         }

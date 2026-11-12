@@ -124,7 +124,11 @@ class Store:
         )
 
     def load_settings(self) -> Settings:
-        return Settings.from_dict(self.kv_get("settings", {}))
+        d = self.kv_get("settings", {})
+        if d and "macd_fast" not in d and d.get("strategy") == "ma_cross":
+            # saved before the MACD rule existed: "ma_cross" was only a placeholder default
+            d["strategy"] = "macd_cross"
+        return Settings.from_dict(d)
 
     def save_settings(self, s: Settings) -> None:
         self.kv_set("settings", s.to_dict())

@@ -171,6 +171,18 @@ def test_settings_validation_and_coercion():
         Settings.from_dict({"ma_fast": "abc"})
 
 
+def test_settings_saved_before_macd_switch_to_the_macd_rule():
+    from mlpt.db import Store
+    store = Store(":memory:")
+    old = {k: v for k, v in Settings(strategy="ma_cross", position_pct=7.0).to_dict().items()
+           if not k.startswith("macd")}
+    store.kv_set("settings", old)
+    s = store.load_settings()
+    assert (s.strategy, s.position_pct, s.macd_fast) == ("macd_cross", 7.0, 11)
+    store.save_settings(Settings(strategy="ma_cross"))                     # an explicit choice is kept
+    assert store.load_settings().strategy == "ma_cross"
+
+
 def test_config_requires_password_when_exposed():
     cfg = Config()
     cfg.web.host = "0.0.0.0"

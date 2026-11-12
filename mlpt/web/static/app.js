@@ -43,10 +43,18 @@ function table(el, head, rows, empty) {
 }
 
 // ---------------------------------------------------------------------- state
+// version of the files this page was loaded with; the server reports the current one
+const ASSETS = new URL(document.currentScript.src, location.href).searchParams.get("v");
+
 const state = { tab: "overview", status: null, chartSymbol: null, chartDate: null, listDate: null, settingsLoaded: false, busy: false };
 
 // --------------------------------------------------------------------- header
 function renderStatus(s) {
+  if (ASSETS && s.assets && s.assets !== ASSETS && sessionStorage.getItem("mlpt-reloaded") !== s.assets) {
+    sessionStorage.setItem("mlpt-reloaded", s.assets);     // the system was updated: load the new dashboard
+    location.reload();
+    return;
+  }
   state.status = s;
   const mode = $("#mode");
   mode.textContent = { live: "LIVE · כסף אמיתי", paper: "PAPER", sim: "סימולציה" }[s.mode] || s.mode;
@@ -158,16 +166,22 @@ document.addEventListener("click", async (e) => {
 // --------------------------------------------------------------------- charts
 let chart = null, candles = null, maFast = null, maSlow = null, priceLines = [], chartKey = "", lastChart = null;
 let macdChart = null, macdHist = null, macdLine = null, macdSignal = null;
-let chartSeq = 0, chartHadData = false;
+let chartSeq = 0, chartHadData = false, syncPaused = false;
 
 // Fit both panes to the data on screen. Dragging a price axis switches the chart
 // library to a manual scale, which would otherwise survive a change of stock and
 // leave e.g. a $40 stock off-screen on the $400 scale of the previous one.
 function resetChartView() {
   if (!chart) return;
+  const few = lastChart && lastChart.bars.length < 60;       // a handful of bars: keep normal candle width
+  // Both panes are set explicitly, so the pane-to-pane sync is paused meanwhile: the library reports
+  // range changes a frame later, and a late report of the old range would undo the fit.
+  syncPaused = true;
   for (const ch of [chart, macdChart]) ch.priceScale("right").applyOptions({ autoScale: true });
-  chart.timeScale().fitContent();
-  macdChart.timeScale().fitContent();
+  for (const ch of [chart, macdChart]) {
+    if (few) { ch.timeScale().applyOptions({ barSpacing: 9 }); ch.timeScale().scrollToRealTime(); } else ch.timeScale().fitContent();
+  }
+  requestAnimationFrame(() => requestAnimationFrame(() => { syncPaused = false; }));
 }
 const cssVar = (n) => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
 
@@ -202,7 +216,7 @@ function ensureChart() {
 
   let syncing = false;
   const link = (a, b) => a.timeScale().subscribeVisibleLogicalRangeChange((r) => {
-    if (syncing || !r) return;
+    if (syncing || syncPaused || !r) return;
     syncing = true; b.timeScale().setVisibleLogicalRange(r); syncing = false;
   });
   link(chart, macdChart); link(macdChart, chart);
@@ -270,6 +284,17 @@ async function loadCharts() {
   macdLine.setData(series("macd"));
   macdSignal.setData(series("signal"));
   macdHist.setData(series("hist", (v) => ({ color: v >= 0 ? cssVar("--up") + "88" : cssVar("--down") + "88" })));
+  // an empty MACD pane always says why
+  const macdEmpty = $("#macd-empty");
+  const withMacd = bars.filter((b) => byTime.get(b.time).macd != null).length;
+  macdEmpty.hidden = withMacd > 0 || !bars.length;
+  if (!macdEmpty.hidden) {
+    macdEmpty.innerHTML = !d.uses_extended && !d.indicator_bars
+      ? 'ה-MACD והממוצעים מחושבים על נרות שעות המסחר הרגילות (<span class="num">09:30–16:00</span> ניו יורק). בתאריך הזה יש כרגע רק נרות מסחר מורחב – הקווים יופיעו עם פתיחת המסחר.'
+      : !d.uses_extended && !bars.some((b) => b.rth)
+        ? "ה-MACD מחושב על נרות שעות המסחר הרגילות. סמן ״מסחר מורחב״ כדי לראות את כל היום."
+        : `אין עדיין מספיק נרות לחישוב ה-MACD: נדרשים ${Number(d.macd_need) + 1} נרות רצופים, כולל היום הקודם.`;
+  }
   const marks = d.markers.filter((m) => byTime.has(m.time));
   candles.setMarkers(marks.map((m) => m.kind === "entry"
     ? { time: m.time, position: "belowBar", shape: "arrowUp", color: cssVar("--accent"), text: m.text }
