@@ -1,0 +1,30 @@
+# Copy this file to config.toml and edit it. config.toml is not committed to git.
+#
+# Trading parameters (position size, take-profit, time windows, moving averages...)
+# are NOT here - they are edited from the dashboard, "הגדרות" tab.
+
+# "paper" - IBKR paper account (start here!)
+# "live"  - real money
+mode = "paper"
+
+# databases and log files; one database per mode (mlpt_paper.db / mlpt_live.db)
+data_dir = "data"
+
+# extra market holidays that the built-in calendar does not know, e.g. ["2026-12-31"]
+extra_holidays = []
+
+[ib]
+host = "127.0.0.1"
+port = 4002          # IB Gateway: 4002 = paper, 4001 = live   (TWS: 7497 / 7496)
+client_id = 17       # keep it constant: open orders belong to the client id
+account = ""         # needed only when the login has more than one account, e.g. "DU1234567"
+
+[web]
+host = "127.0.0.1"   # dashboard on the VPS only: http://127.0.0.1:8080 (through Remote Desktop)
+port = 8080
+username = "admin"
+password = ""        # REQUIRED if host is changed to anything other than 127.0.0.1
+
+[telegram]
+bot_token = ""       # from @BotFather; may also be given as the MLPT_TELEGRAM_TOKEN environment variable
+chat_id = ""         # your chat id; or MLPT_TELEGRAM_CHAT_ID

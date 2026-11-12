@@ -1,0 +1,14 @@
+# secrets and local state
+config.toml
+data/
+*.db
+*.db-wal
+*.db-shm
+*.log
+
+# python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/

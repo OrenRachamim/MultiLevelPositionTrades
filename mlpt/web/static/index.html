@@ -1,0 +1,159 @@
+<!doctype html>
+<html lang="he" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MLPT · מסחר תוך-יומי / סווינג</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="top">
+  <div class="brand">
+    <strong>MLPT</strong>
+    <span id="mode" class="badge">…</span>
+    <span id="conn" class="conn"><i></i><span>מתחבר…</span></span>
+  </div>
+  <div class="clock">
+    <span>ניו יורק <b id="t-ny" class="num">--:--:--</b></span>
+    <span>ישראל <b id="t-il" class="num">--:--</b></span>
+    <span id="session" class="badge">…</span>
+    <span id="window" class="badge">…</span>
+  </div>
+  <div class="kpis">
+    <div><label>שווי תיק</label><b id="k-net" class="num">–</b></div>
+    <div><label>מזומן פנוי למסחר</label><b id="k-cash" class="num">–</b></div>
+    <div><label>רווח ממומש היום</label><b id="k-real" class="num">–</b></div>
+    <div><label>רווח לא ממומש</label><b id="k-unreal" class="num">–</b></div>
+  </div>
+  <button id="kill" class="btn">…</button>
+</header>
+<div id="banner" class="banner" hidden></div>
+
+<nav class="tabs" role="tablist">
+  <a href="#overview" data-tab="overview">סקירה</a>
+  <a href="#charts" data-tab="charts">גרפים</a>
+  <a href="#list" data-tab="list">רשימה יומית</a>
+  <a href="#history" data-tab="history">היסטוריה</a>
+  <a href="#settings" data-tab="settings">הגדרות</a>
+  <a href="#log" data-tab="log">לוג</a>
+</nav>
+
+<main>
+  <section id="tab-overview" class="tab">
+    <div class="panel">
+      <h2>פוזיציות פתוחות <span id="open-count" class="muted"></span></h2>
+      <div class="scroll"><table id="open-table"></table></div>
+    </div>
+    <div class="panel">
+      <h2>הרשימה של היום <span id="today-date" class="muted num"></span></h2>
+      <div class="scroll"><table id="today-table"></table></div>
+    </div>
+    <div class="panel">
+      <h2>אירועים אחרונים</h2>
+      <div class="scroll"><table id="recent-table"></table></div>
+    </div>
+  </section>
+
+  <section id="tab-charts" class="tab" hidden>
+    <div class="panel">
+      <div class="toolbar">
+        <label>תאריך <input type="date" id="chart-date"></label>
+        <div id="chart-symbols" class="chips"></div>
+        <label class="check"><input type="checkbox" id="chart-ext" checked> מסחר מורחב (לפני/אחרי)</label>
+      </div>
+      <div id="chart-legend" class="legend" dir="ltr"></div>
+      <div id="chart" dir="ltr"></div>
+      <div class="chart-key">
+        <span><i class="key up"></i> נר עולה (חלול)</span>
+        <span><i class="key down"></i> נר יורד (מלא)</span>
+        <span><i class="key line fast"></i> <span id="key-fast">ממוצע מהיר</span></span>
+        <span><i class="key line slow"></i> <span id="key-slow">ממוצע איטי</span></span>
+        <span>▲ קנייה · ▼ מכירה</span>
+        <span>קווים מקווקווים: כניסה / TP / SL של פוזיציה פתוחה</span>
+        <span class="muted">הזמנים בשעון ניו יורק</span>
+      </div>
+      <p id="chart-empty" class="muted" hidden>אין נרות לתאריך ולמניה שנבחרו.</p>
+    </div>
+  </section>
+
+  <section id="tab-list" class="tab" hidden>
+    <div class="panel">
+      <h2>טעינת רשימה יומית</h2>
+      <div class="form-row">
+        <label>ליום המסחר <input type="date" id="list-date"></label>
+        <label class="file">קובץ CSV <input type="file" id="list-file" accept=".csv,.txt,text/csv,text/plain"></label>
+        <a class="btn ghost" href="/api/watchlist/template" download>הורד תבנית CSV</a>
+      </div>
+      <textarea id="list-text" dir="ltr" spellcheck="false" rows="9"
+        placeholder="symbol,intraday_tp_pct,intraday_sl_pct,swing_tp_pct,swing_sl_pct,max_hold_days,position_pct,max_position_usd&#10;AAPL,0.5,,6,4,5,10,&#10;NVDA,0.7,3,8,5,,,3000&#10;&#10;אפשר גם רשימת סימולים בלבד: AAPL, MSFT, NVDA"></textarea>
+      <div class="form-row">
+        <label class="check"><input type="checkbox" id="list-replace"> החלף את הרשימה הקיימת לתאריך (מניות שלא ברשימה החדשה יוסרו)</label>
+        <button id="list-submit" class="btn primary">טען רשימה</button>
+      </div>
+      <div id="list-result"></div>
+      <details>
+        <summary>מבנה הקובץ</summary>
+        <table class="doc">
+          <tr><th>עמודה</th><th>משמעות</th><th>אם ריק</th></tr>
+          <tr><td dir="ltr">symbol</td><td>סימול המניה (חובה)</td><td>–</td></tr>
+          <tr><td dir="ltr">intraday_tp_pct</td><td>יעד רווח תוך-יומי, באחוזים ממחיר הכניסה</td><td>ברירת המחדל בהגדרות</td></tr>
+          <tr><td dir="ltr">intraday_sl_pct</td><td>סטופ בזמן השלב התוך-יומי, באחוזים</td><td>הסטופ של הסווינג</td></tr>
+          <tr><td dir="ltr">swing_tp_pct</td><td>יעד רווח בסווינג, באחוזים ממחיר הכניסה</td><td>ברירת המחדל בהגדרות</td></tr>
+          <tr><td dir="ltr">swing_sl_pct</td><td>סטופ בסווינג, באחוזים ממחיר הכניסה</td><td>ברירת המחדל בהגדרות</td></tr>
+          <tr><td dir="ltr">max_hold_days</td><td>מקסימום ימי מסחר בסווינג, ואז יציאה לפני הסגירה</td><td>ללא הגבלה</td></tr>
+          <tr><td dir="ltr">position_pct</td><td>אחוז מהתיק לפוזיציה</td><td>ברירת המחדל בהגדרות</td></tr>
+          <tr><td dir="ltr">max_position_usd</td><td>תקרה בדולרים לפוזיציה</td><td>ברירת המחדל בהגדרות</td></tr>
+        </table>
+      </details>
+    </div>
+    <div class="panel">
+      <h2>הרשימה לתאריך <span id="list-shown" class="muted num"></span></h2>
+      <div class="scroll"><table id="list-table"></table></div>
+    </div>
+  </section>
+
+  <section id="tab-history" class="tab" hidden>
+    <div id="stats" class="tiles"></div>
+    <div class="panel">
+      <h2>עסקאות סגורות</h2>
+      <div class="scroll"><table id="closed-table"></table></div>
+    </div>
+  </section>
+
+  <section id="tab-settings" class="tab" hidden>
+    <div class="panel">
+      <h2>הגדרות מסחר</h2>
+      <form id="settings-form"></form>
+      <div class="form-row">
+        <button id="settings-save" class="btn primary">שמור הגדרות</button>
+        <button id="tg-test" class="btn ghost">שלח הודעת בדיקה לטלגרם</button>
+        <span id="settings-msg" class="muted"></span>
+      </div>
+      <p class="muted">שינוי הגדרות חל על כניסות חדשות. פוזיציות פתוחות שומרות על היעדים שנקבעו להן בכניסה.</p>
+    </div>
+  </section>
+
+  <section id="tab-log" class="tab" hidden>
+    <div class="panel">
+      <div class="toolbar">
+        <label>רמה
+          <select id="log-level">
+            <option value="">הכול</option><option value="WARN">אזהרות</option><option value="ERROR">שגיאות</option>
+          </select>
+        </label>
+        <label>מניה <input id="log-symbol" dir="ltr" size="7" placeholder="AAPL"></label>
+      </div>
+      <div class="scroll tall"><table id="log-table"></table></div>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <span id="version" class="muted"></span>
+  <span class="muted" dir="ltr">Charts: <a href="https://www.tradingview.com/" target="_blank" rel="noopener">TradingView Lightweight Charts™</a></span>
+</footer>
+
+<script src="/static/vendor/lightweight-charts.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>

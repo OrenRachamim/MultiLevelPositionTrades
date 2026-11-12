@@ -1,0 +1,396 @@
+"use strict";
+/* MLPT dashboard - plain JS, polls the local API. */
+
+const $ = (sel, root = document) => root.querySelector(sel);
+const esc = (v) => String(v ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+async function api(path, { method = "GET", body } = {}) {
+  const opts = { method, headers: { "X-MLPT": "1" } };
+  if (body !== undefined) {
+    opts.headers["Content-Type"] = "application/json";
+    opts.body = JSON.stringify(body);
+  }
+  const res = await fetch(path, opts);
+  if (!res.ok) {
+    let detail = res.statusText;
+    try { detail = (await res.json()).detail || detail; } catch (_) { /* not json */ }
+    throw new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
+  }
+  return res.json();
+}
+
+// ---------------------------------------------------------------- formatting
+const usd = (v, digits = 2) => v == null ? "–" : "$" + Number(v).toLocaleString("en-US", { minimumFractionDigits: digits, maximumFractionDigits: digits });
+const signed = (v) => v == null ? "–" : (v >= 0 ? "+" : "−") + "$" + Math.abs(v).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const pct = (v, digits = 2) => v == null ? "–" : (v >= 0 ? "+" : "−") + Math.abs(v).toFixed(digits) + "%";
+const plain = (v) => v == null ? "–" : String(+Number(v).toFixed(2));
+const cls = (v) => !v ? "" : v > 0 ? "pos" : "neg";
+const fmtTime = (tz, opts) => new Intl.DateTimeFormat("en-GB", { timeZone: tz, hour12: false, ...opts });
+const NY_FULL = fmtTime("America/New_York", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit" });
+const NY_CLOCK = fmtTime("America/New_York", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+const IL_CLOCK = fmtTime("Asia/Jerusalem", { hour: "2-digit", minute: "2-digit" });
+const nyTime = (ts) => ts ? NY_FULL.format(new Date(ts * 1000)).replace(",", "") : "–";
+
+const SESSION = { PRE: ["טרום-מסחר", "warn"], RTH: ["שעות מסחר", "on"], POST: ["אחרי המסחר", "warn"], CLOSED: ["שוק סגור", "off"], HOLIDAY: ["אין מסחר היום", "off"] };
+const PHASE = { ENTERING: "בכניסה", INTRADAY: "תוך-יומי", SWING: "סווינג" };
+const WSTATUS = { WATCHING: ["במעקב", "on"], ENTERED: ["בוצעה כניסה", ""], NO_SIGNAL: ["אין אות", "off"], SKIPPED: ["דילוג", "warn"] };
+const REASON = { TP: "Take Profit", SL: "Stop Loss", MANUAL: "ידני", TIME: "מקס׳ ימים", EXTERNAL: "מחוץ למערכת" };
+
+function table(el, head, rows, empty) {
+  const th = head.map((h) => `<th class="${h.num ? "num" : ""}">${esc(h.t)}</th>`).join("");
+  const body = rows.length ? rows.join("") : `<tr><td class="empty" colspan="${head.length}">${esc(empty)}</td></tr>`;
+  el.innerHTML = `<thead><tr>${th}</tr></thead><tbody>${body}</tbody>`;
+}
+
+// ---------------------------------------------------------------------- state
+const state = { tab: "overview", status: null, chartSymbol: null, chartDate: null, listDate: null, settingsLoaded: false, busy: false };
+
+// --------------------------------------------------------------------- header
+function renderStatus(s) {
+  state.status = s;
+  const mode = $("#mode");
+  mode.textContent = { live: "LIVE · כסף אמיתי", paper: "PAPER", sim: "סימולציה" }[s.mode] || s.mode;
+  mode.className = "badge " + s.mode;
+  const conn = $("#conn");
+  conn.className = "conn " + (s.connected ? "ok" : "bad");
+  conn.lastElementChild.textContent = s.connected ? "מחובר לברוקר" : "אין חיבור לברוקר";
+  const now = new Date(s.now * 1000);
+  $("#t-ny").textContent = NY_CLOCK.format(now);
+  $("#t-il").textContent = IL_CLOCK.format(now);
+  const [st, sc] = SESSION[s.session] || [s.session, ""];
+  $("#session").textContent = st;
+  $("#session").className = "badge " + sc;
+  const w = s.entry_window;
+  $("#window").innerHTML = `חלון כניסה <span class="num">${esc(w.start)}–${esc(w.end)}</span>` + (w.open ? " · פתוח" : "");
+  $("#window").className = "badge " + (w.open ? "on" : "off");
+  const a = s.account;
+  $("#k-net").textContent = a ? usd(a.net_liq) : "–";
+  $("#k-cash").textContent = a ? usd(a.for_trading) : "–";
+  const real = $("#k-real"), unreal = $("#k-unreal");
+  real.textContent = signed(s.realized_today); real.className = "num " + cls(s.realized_today);
+  unreal.textContent = signed(s.unrealized_pnl); unreal.className = "num " + cls(s.unrealized_pnl);
+  const kill = $("#kill");
+  kill.textContent = s.trading_enabled ? "השבת כניסות חדשות" : "הפעל כניסות חדשות";
+  kill.className = "btn " + (s.trading_enabled ? "danger" : "go");
+  const banner = $("#banner");
+  const msgs = [];
+  if (s.fatal) msgs.push(s.fatal);
+  if (!s.trading_enabled) msgs.push("כניסות חדשות מושבתות. פוזיציות פתוחות ממשיכות להיות מנוהלות.");
+  banner.hidden = !msgs.length;
+  banner.textContent = msgs.join(" · ");
+  $("#version").textContent = `MLPT ${s.version}` + (a ? ` · חשבון ${a.id}` : "") + (s.telegram ? " · טלגרם פעיל" : " · טלגרם לא מוגדר");
+}
+
+$("#kill").addEventListener("click", async () => {
+  const enable = !state.status.trading_enabled;
+  if (!enable && !confirm("להשבית כניסות חדשות? פוזיציות פתוחות ימשיכו להיות מנוהלות.")) return;
+  await api("/api/trading", { method: "POST", body: { enabled: enable } });
+  refresh();
+});
+
+// ------------------------------------------------------------------- overview
+function watchRows(items, withRemove) {
+  const p = (it, k, unit) => {
+    const own = it[k] != null, v = it.effective[k];
+    const text = !v ? "–" : unit === "$" ? usd(v, 0) : unit === "d" ? v : plain(v) + "%";
+    return `<td class="num ${own ? "" : "default"}" title="${own ? "מהרשימה" : "ברירת מחדל"}">${text}</td>`;
+  };
+  return items.map((it) => {
+    const [label, c] = WSTATUS[it.status] || [it.status, ""];
+    return `<tr><td class="sym">${esc(it.symbol)}</td><td><span class="badge ${c}">${label}</span></td>
+      <td class="num">${it.last == null ? "–" : usd(it.last)}</td>
+      ${p(it, "intraday_tp_pct")}${p(it, "intraday_sl_pct")}${p(it, "swing_tp_pct")}${p(it, "swing_sl_pct")}
+      ${p(it, "max_hold_days", "d")}${p(it, "position_pct")}${p(it, "max_position_usd", "$")}
+      <td class="wrap">${esc(it.note)}</td>
+      <td><button class="btn small ghost" data-chart="${esc(it.symbol)}">גרף</button>
+      ${withRemove && it.status !== "ENTERED" ? `<button class="btn small ghost" data-remove="${it.id}">הסר</button>` : ""}</td></tr>`;
+  });
+}
+const WATCH_HEAD = [{ t: "מניה" }, { t: "סטטוס" }, { t: "מחיר אחרון", num: 1 }, { t: "TP תוך-יומי", num: 1 }, { t: "SL תוך-יומי", num: 1 },
+  { t: "TP סווינג", num: 1 }, { t: "SL סווינג", num: 1 }, { t: "מקס׳ ימים", num: 1 }, { t: "% מהתיק", num: 1 }, { t: "תקרה $", num: 1 }, { t: "הערה" }, { t: "" }];
+
+function eventRows(items) {
+  return items.map((e) => `<tr class="lvl-${esc(e.level)}"><td class="num">${nyTime(e.ts)}</td><td>${esc(e.kind)}</td>
+    <td class="sym">${esc(e.symbol || "")}</td><td class="wrap">${esc(e.message)}</td></tr>`);
+}
+const EVENT_HEAD = [{ t: "זמן (ניו יורק)", num: 1 }, { t: "סוג" }, { t: "מניה" }, { t: "הודעה" }];
+
+async function loadOverview() {
+  const [pos, wl, ev] = await Promise.all([api("/api/positions?which=open"), api("/api/watchlist"), api("/api/events?limit=12")]);
+  $("#open-count").textContent = pos.items.length ? `(${pos.items.length})` : "";
+  table($("#open-table"), [{ t: "מניה" }, { t: "שלב" }, { t: "כמות", num: 1 }, { t: "כניסה", num: 1 }, { t: "אחרון", num: 1 },
+    { t: "רווח/הפסד", num: 1 }, { t: "%", num: 1 }, { t: "TP", num: 1 }, { t: "SL", num: 1 }, { t: "ימים", num: 1 }, { t: "הגנה" }, { t: "" }],
+    pos.items.map((p) => {
+      const guard = p.state === "ENTERING" ? "" : p.halted ? '<span class="badge bad">נעצר – טיפול ידני</span>'
+        : p.exit_request ? '<span class="badge warn">ביציאה</span>'
+        : p.protected ? '<span class="badge on">TP + SL פעילים</span>' : '<span class="badge bad">לא מוגן</span>';
+      return `<tr><td class="sym">${esc(p.symbol)}</td><td><span class="badge">${PHASE[p.state] || p.state}</span></td>
+        <td class="num">${p.qty_open || "–"}</td><td class="num">${usd(p.entry_price)}</td><td class="num">${usd(p.last)}</td>
+        <td class="num ${cls(p.unrealized)}">${signed(p.unrealized)}</td><td class="num ${cls(p.unrealized_pct)}">${pct(p.unrealized_pct)}</td>
+        <td class="num">${usd(p.tp_price)}</td><td class="num">${usd(p.sl_price)}</td><td class="num">${p.days_held ?? "–"}</td><td>${guard}</td>
+        <td><button class="btn small ghost" data-chart="${esc(p.symbol)}">גרף</button>
+        ${p.state !== "ENTERING" ? `<button class="btn small danger" data-close="${p.id}" data-sym="${esc(p.symbol)}">סגור</button>` : ""}</td></tr>`;
+    }), "אין פוזיציות פתוחות");
+  $("#today-date").textContent = wl.date;
+  table($("#today-table"), WATCH_HEAD, watchRows(wl.items, false), "לא נטענה רשימה להיום – לשונית ״רשימה יומית״");
+  table($("#recent-table"), EVENT_HEAD, eventRows(ev.items), "אין אירועים");
+}
+
+document.addEventListener("click", async (e) => {
+  const t = e.target.closest("button");
+  if (!t) return;
+  if (t.dataset.chart) {
+    state.chartSymbol = t.dataset.chart;
+    state.chartDate = t.dataset.date || (state.tab === "list" ? state.listDate : null);
+    location.hash = "#charts";
+  } else if (t.dataset.close) {
+    if (!confirm(`לסגור את הפוזיציה ב-${t.dataset.sym} עכשיו במחיר שוק?`)) return;
+    const r = await api(`/api/positions/${t.dataset.close}/close`, { method: "POST" });
+    alert(r.message);
+    refresh();
+  } else if (t.dataset.remove) {
+    const r = await api(`/api/watchlist/${t.dataset.remove}`, { method: "DELETE" });
+    if (!r.ok) alert(r.message);
+    refresh();
+  }
+});
+
+// --------------------------------------------------------------------- charts
+let chart = null, candles = null, maFast = null, maSlow = null, priceLines = [], chartKey = "", lastChart = null;
+const cssVar = (n) => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+
+function ensureChart() {
+  if (chart) return;
+  const c = { surface: cssVar("--surface"), text: cssVar("--text-2"), grid: cssVar("--grid"), border: cssVar("--border"), up: cssVar("--up"), down: cssVar("--down") };
+  chart = LightweightCharts.createChart($("#chart"), {
+    autoSize: true,
+    layout: { background: { color: c.surface }, textColor: c.text, fontFamily: "Segoe UI, system-ui, Arial, sans-serif" },
+    grid: { vertLines: { color: c.grid }, horzLines: { color: c.grid } },
+    rightPriceScale: { borderColor: c.border },
+    timeScale: { borderColor: c.border, timeVisible: true, secondsVisible: false },
+    crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
+    localization: { locale: "en-GB" },
+  });
+  // rising candles are hollow, falling candles are filled: readable without relying on colour
+  candles = chart.addCandlestickSeries({ upColor: c.surface, downColor: c.down, borderUpColor: c.up, borderDownColor: c.down, wickUpColor: c.up, wickDownColor: c.down, priceLineVisible: false });
+  maFast = chart.addLineSeries({ color: cssVar("--ma-fast"), lineWidth: 2, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false });
+  maSlow = chart.addLineSeries({ color: cssVar("--ma-slow"), lineWidth: 2, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false });
+  chart.subscribeCrosshairMove((p) => renderLegend(p && p.time ? p : null));
+}
+
+function renderLegend(point) {
+  const d = lastChart;
+  if (!d || !d.bars.length) { $("#chart-legend").textContent = ""; return; }
+  let bar = d.bars[d.bars.length - 1], f = d.ma_fast[d.ma_fast.length - 1], s = d.ma_slow[d.ma_slow.length - 1];
+  if (point) {
+    bar = point.seriesData.get(candles) || bar;
+    f = point.seriesData.get(maFast); s = point.seriesData.get(maSlow);
+    const full = d.bars.find((b) => b.time === bar.time);
+    if (full) bar = full;
+  }
+  const hhmm = new Date(bar.time * 1000).toISOString().slice(11, 16);
+  $("#chart-legend").innerHTML = `<b>${esc(d.symbol)}</b><span>${hhmm} NY${bar.rth === false ? " (ext)" : ""}</span>
+    <span>O ${bar.open.toFixed(2)}</span><span>H ${bar.high.toFixed(2)}</span><span>L ${bar.low.toFixed(2)}</span><span>C ${bar.close.toFixed(2)}</span>
+    ${bar.volume != null ? `<span>Vol ${Number(bar.volume).toLocaleString("en-US")}</span>` : ""}
+    ${f ? `<span style="border-bottom:2px solid ${cssVar("--ma-fast")}">${esc(d.ma_labels[0])} ${f.value.toFixed(2)}</span>` : ""}
+    ${s ? `<span style="border-bottom:2px solid ${cssVar("--ma-slow")}">${esc(d.ma_labels[1])} ${s.value.toFixed(2)}</span>` : ""}
+    ${d.levels.map((l) => `<span>${{ entry: "Entry", tp: "TP", sl: "SL" }[l.kind]} ${l.price.toFixed(2)}</span>`).join("")}`;
+}
+
+async function loadCharts() {
+  const dateInput = $("#chart-date");
+  if (!state.chartDate) state.chartDate = state.status.today;
+  if (dateInput.value !== state.chartDate) dateInput.value = state.chartDate;
+  const sy = await api(`/api/symbols?date=${state.chartDate}`);
+  if (!state.chartSymbol || (!sy.symbols.includes(state.chartSymbol) && sy.symbols.length)) state.chartSymbol = sy.symbols[0] || null;
+  $("#chart-symbols").innerHTML = sy.symbols.map((s) => `<button data-sym="${esc(s)}" class="${s === state.chartSymbol ? "active" : ""}">${esc(s)}</button>`).join("")
+    || '<span class="muted">אין מניות לתאריך הזה</span>';
+  if (!state.chartSymbol) { $("#chart-empty").hidden = false; return; }
+  const d = await api(`/api/chart?symbol=${encodeURIComponent(state.chartSymbol)}&date=${state.chartDate}`);
+  ensureChart();
+  const ext = $("#chart-ext").checked, extColor = cssVar("--ext");
+  const bars = d.bars.filter((b) => ext || b.rth).map((b) => b.rth ? b
+    : { ...b, color: b.close >= b.open ? cssVar("--surface") : extColor, borderColor: extColor, wickColor: extColor });
+  lastChart = { ...d, bars };
+  candles.setData(bars);
+  maFast.setData(d.ma_fast);
+  maSlow.setData(d.ma_slow);
+  const shown = new Set(bars.map((b) => b.time));
+  candles.setMarkers(d.markers.filter((m) => shown.has(m.time)).map((m) => m.kind === "entry"
+    ? { time: m.time, position: "belowBar", shape: "arrowUp", color: cssVar("--accent"), text: m.text }
+    : { time: m.time, position: "aboveBar", shape: "arrowDown", color: m.win ? cssVar("--up") : cssVar("--down"), text: m.text }));
+  priceLines.forEach((l) => candles.removePriceLine(l));
+  const style = { entry: ["כניסה", cssVar("--accent")], tp: ["TP", cssVar("--up")], sl: ["SL", cssVar("--down")] };
+  priceLines = d.levels.filter((l) => l.price).map((l) => candles.createPriceLine({
+    price: l.price, color: style[l.kind][1], lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dashed, axisLabelVisible: true, title: style[l.kind][0] }));
+  $("#key-fast").textContent = d.ma_labels[0];
+  $("#key-slow").textContent = d.ma_labels[1];
+  $("#chart-empty").hidden = bars.length > 0;
+  const key = `${d.symbol}|${d.date}|${ext}`;
+  if (key !== chartKey) { chartKey = key; chart.timeScale().fitContent(); }
+  renderLegend(null);
+}
+$("#chart-symbols").addEventListener("click", (e) => { const b = e.target.closest("button"); if (b) { state.chartSymbol = b.dataset.sym; loadCharts(); } });
+$("#chart-date").addEventListener("change", (e) => { state.chartDate = e.target.value || null; loadCharts(); });
+$("#chart-ext").addEventListener("change", loadCharts);
+
+// ----------------------------------------------------------------- daily list
+async function loadList() {
+  if (!state.listDate) { state.listDate = state.status.suggested_list_date; $("#list-date").value = state.listDate; }
+  const wl = await api(`/api/watchlist?date=${state.listDate}`);
+  $("#list-shown").textContent = wl.date;
+  table($("#list-table"), WATCH_HEAD, watchRows(wl.items, true), "אין רשימה לתאריך הזה");
+}
+$("#list-date").addEventListener("change", (e) => { state.listDate = e.target.value || null; loadList(); });
+$("#list-file").addEventListener("change", (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = () => { $("#list-text").value = reader.result; };
+  reader.readAsText(file);
+});
+$("#list-submit").addEventListener("click", async () => {
+  const out = $("#list-result");
+  const text = $("#list-text").value;
+  if (!text.trim()) { out.innerHTML = '<p class="msg-err">הדבק רשימה או בחר קובץ CSV</p>'; return; }
+  try {
+    const r = await api("/api/watchlist", { method: "POST", body: { date: $("#list-date").value, text, replace: $("#list-replace").checked } });
+    if (!r.ok) {
+      out.innerHTML = `<p class="msg-err">הרשימה לא נטענה:</p><ul class="msg-err">${r.errors.map((x) => `<li>${esc(x)}</li>`).join("")}</ul>`;
+    } else {
+      out.innerHTML = `<p class="msg-ok">נטען: ${r.added} חדשות, ${r.updated} עודכנו${r.removed ? `, ${r.removed} הוסרו` : ""}${r.kept ? `, ${r.kept} ללא שינוי` : ""}</p>`
+        + (r.warnings.length ? `<ul class="msg-warn">${r.warnings.map((x) => `<li>${esc(x)}</li>`).join("")}</ul>` : "");
+      $("#list-text").value = ""; $("#list-file").value = "";
+    }
+  } catch (err) { out.innerHTML = `<p class="msg-err">${esc(err.message)}</p>`; }
+  loadList();
+});
+
+// -------------------------------------------------------------------- history
+async function loadHistory() {
+  const r = await api("/api/positions?which=closed");
+  const s = r.stats;
+  const tile = (label, value, sub, c = "") => `<div class="tile"><label>${label}</label><b class="num ${c}">${value}</b><small>${sub}</small></div>`;
+  const part = (p) => p.count ? `${p.wins} רווחיות מתוך ${p.count}` : "אין עסקאות";
+  $("#stats").innerHTML =
+    tile("רווח ממומש כולל", signed(s.all.pnl), `אחרי עמלות (${usd(s.all.commission)})`, cls(s.all.pnl)) +
+    tile("עסקאות סגורות", s.all.count, s.all.win_rate == null ? "–" : `${s.all.win_rate}% רווחיות`) +
+    tile("נסגרו תוך-יומי", s.intraday.count ? signed(s.intraday.pnl) : "–", part(s.intraday), cls(s.intraday.pnl)) +
+    tile("נסגרו בסווינג", s.swing.count ? signed(s.swing.pnl) : "–", part(s.swing), cls(s.swing.pnl));
+  table($("#closed-table"), [{ t: "מניה" }, { t: "יום כניסה", num: 1 }, { t: "כמות", num: 1 }, { t: "כניסה", num: 1 }, { t: "יציאה", num: 1 },
+    { t: "רווח/הפסד", num: 1 }, { t: "%", num: 1 }, { t: "עמלות", num: 1 }, { t: "נסגרה כ־" }, { t: "סיבה" }, { t: "זמן יציאה (ניו יורק)", num: 1 }, { t: "" }],
+    r.items.map((p) => `<tr><td class="sym">${esc(p.symbol)}</td><td class="num">${esc(p.trade_date)}</td><td class="num">${p.qty}</td>
+      <td class="num">${usd(p.entry_price)}</td><td class="num">${usd(p.exit_price)}</td>
+      <td class="num ${cls(p.pnl)}">${signed(p.pnl)}</td><td class="num ${cls(p.pnl_pct)}">${pct(p.pnl_pct)}</td><td class="num">${usd(p.commission)}</td>
+      <td>${PHASE[p.exit_phase] || esc(p.exit_phase)}</td><td>${REASON[p.exit_reason] || esc(p.exit_reason)}</td><td class="num">${nyTime(p.exit_time)}</td>
+      <td><button class="btn small ghost" data-chart="${esc(p.symbol)}" data-date="${esc(p.trade_date)}">גרף</button></td></tr>`),
+    "עדיין אין עסקאות סגורות");
+}
+
+// ------------------------------------------------------------------- settings
+const SETTINGS = [
+  ["גודל פוזיציה", [
+    ["position_pct", "אחוז מהתיק לכל פוזיציה", "number", "מחושב משווי התיק (Net Liquidation)"],
+    ["max_position_usd", "תקרה בדולרים לפוזיציה", "number", "0 = ללא תקרה"],
+    ["cash_reserve_usd", "מזומן שלא נוגעים בו ($)", "number", ""],
+    ["max_open_positions", "מקסימום פוזיציות פתוחות", "number", "0 = ללא הגבלה"],
+  ]],
+  ["ברירות מחדל לעסקה (כשהתא ברשימה ריק)", [
+    ["intraday_tp_pct", "יעד רווח תוך-יומי %", "number", ""],
+    ["intraday_sl_pct", "סטופ תוך-יומי %", "number", "0 = הסטופ של הסווינג"],
+    ["swing_tp_pct", "יעד רווח סווינג %", "number", ""],
+    ["swing_sl_pct", "סטופ סווינג %", "number", ""],
+    ["max_hold_days", "מקסימום ימי החזקה", "number", "ימי מסחר, 0 = ללא הגבלה"],
+  ]],
+  ["חלונות זמן (שעון ניו יורק)", [
+    ["entry_start", "תחילת חלון הכניסה", "hhmm", "כניסה לפני 09:30 דורשת גם ״נרות מסחר מורחב״"],
+    ["entry_end", "סוף חלון הכניסה", "hhmm", ""],
+    ["intraday_end", "סוף השלב התוך-יומי", "hhmm", "אחריו הפוזיציה עוברת ליעדי הסווינג"],
+  ]],
+  ["ביצוע", [
+    ["entry_slippage_pct", "מרווח מחיר בכניסה %", "number", "פקודת Limit במחיר האות + המרווח"],
+    ["entry_timeout_sec", "ביטול כניסה שלא התמלאה (שניות)", "number", ""],
+    ["max_signal_age_sec", "גיל מקסימלי של אות (שניות)", "number", "נר שהגיע באיחור לא יפעיל כניסה"],
+    ["tp_outside_rth", "Take Profit גם מחוץ לשעות המסחר", "checkbox", ""],
+    ["sl_outside_rth", "Stop Loss גם מחוץ לשעות המסחר", "checkbox", "לא מומלץ: נזילות נמוכה"],
+  ]],
+  ["אסטרטגיית כניסה תוך-יומית", [
+    ["strategy", "אסטרטגיה", "select", ""],
+    ["ma_type", "סוג ממוצע נע", "select:EMA,SMA", ""],
+    ["ma_fast", "ממוצע מהיר (נרות דקה)", "number", ""],
+    ["ma_slow", "ממוצע איטי (נרות דקה)", "number", ""],
+    ["use_extended_bars", "לכלול נרות מסחר מורחב בחישוב", "checkbox", ""],
+  ]],
+];
+
+async function loadSettings(force) {
+  if (state.settingsLoaded && !force) return;
+  const r = await api("/api/settings");
+  $("#settings-form").innerHTML = SETTINGS.map(([title, fields]) => `<fieldset><legend>${title}</legend>` + fields.map(([key, label, type, hint]) => {
+    const v = r.settings[key];
+    let input;
+    if (type === "checkbox") input = `<input type="checkbox" name="${key}" ${v ? "checked" : ""}>`;
+    else if (type.startsWith("select")) {
+      const options = type === "select" ? r.strategies : type.split(":")[1].split(",");
+      input = `<select name="${key}">${options.map((o) => `<option ${o === v ? "selected" : ""}>${esc(o)}</option>`).join("")}</select>`;
+    } else if (type === "hhmm") input = `<input type="text" name="${key}" value="${esc(v)}" placeholder="HH:MM" pattern="[0-2][0-9]:[0-5][0-9]" maxlength="5">`;
+    else input = `<input type="number" name="${key}" value="${esc(v)}" step="any" min="0">`;
+    return `<div class="field"><label for="${key}">${label}</label>${input}${hint ? `<small>${hint}</small>` : ""}</div>`;
+  }).join("") + "</fieldset>").join("");
+  state.settingsLoaded = true;
+}
+$("#settings-save").addEventListener("click", async (e) => {
+  e.preventDefault();
+  const body = {};
+  for (const el of $("#settings-form").elements) if (el.name) body[el.name] = el.type === "checkbox" ? el.checked : el.value;
+  const msg = $("#settings-msg");
+  try {
+    await api("/api/settings", { method: "PUT", body });
+    msg.textContent = "נשמר ✓"; msg.className = "msg-ok";
+    await loadSettings(true);
+  } catch (err) { msg.textContent = "שגיאה: " + err.message; msg.className = "msg-err"; }
+});
+$("#tg-test").addEventListener("click", async (e) => {
+  e.preventDefault();
+  const r = await api("/api/telegram/test", { method: "POST" });
+  const msg = $("#settings-msg");
+  msg.textContent = "טלגרם: " + r.message; msg.className = r.ok ? "msg-ok" : "msg-err";
+});
+
+// ------------------------------------------------------------------------ log
+async function loadLog() {
+  const level = $("#log-level").value, symbol = $("#log-symbol").value.trim();
+  const r = await api(`/api/events?limit=400&level=${level}&symbol=${encodeURIComponent(symbol)}`);
+  table($("#log-table"), EVENT_HEAD, eventRows(r.items), "אין אירועים");
+}
+$("#log-level").addEventListener("change", loadLog);
+$("#log-symbol").addEventListener("input", loadLog);
+
+// ---------------------------------------------------------------------- shell
+const LOADERS = { overview: loadOverview, charts: loadCharts, list: loadList, history: loadHistory, settings: loadSettings, log: loadLog };
+
+function showTab() {
+  const tab = (location.hash || "#overview").slice(1);
+  state.tab = LOADERS[tab] ? tab : "overview";
+  document.querySelectorAll(".tab").forEach((s) => { s.hidden = s.id !== "tab-" + state.tab; });
+  document.querySelectorAll(".tabs a").forEach((a) => a.classList.toggle("active", a.dataset.tab === state.tab));
+  refresh();
+}
+
+async function refresh() {
+  if (state.busy) return;
+  state.busy = true;
+  try {
+    renderStatus(await api("/api/status"));
+    await LOADERS[state.tab]();
+  } catch (err) {
+    const conn = $("#conn");
+    conn.className = "conn bad";
+    conn.lastElementChild.textContent = "אין תקשורת עם המערכת";
+    console.error(err);
+  } finally { state.busy = false; }
+}
+
+window.addEventListener("hashchange", showTab);
+showTab();
+setInterval(() => { if (!document.hidden) refresh(); }, 2000);
