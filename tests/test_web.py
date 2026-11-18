@@ -153,3 +153,27 @@ def test_backtest_job_runs_in_a_separate_process(tmp_path):
     assert "MACD" in trail["rows"][0]["signal"] and trail["unrealized"] > plain["realized"]
     assert rig.positions() == [] and rig.engine.settings.intraday_trail_pct == 0     # the live engine is untouched
     assert (tmp_path / "mlpt_backtest.db").exists()
+
+
+def test_every_handler_runs_on_the_engine_thread(rig: Rig):
+    """A plain ``def`` handler would run in a worker thread and race the engine on its database connection."""
+    import inspect
+    import threading
+
+    from fastapi.routing import APIRoute
+
+    app = create_app(rig.engine, Config(mode="sim"))
+    routes = [r for r in app.routes if isinstance(r, APIRoute)]
+    assert len(routes) >= 20
+    assert [r.path for r in routes if not inspect.iscoroutinefunction(r.endpoint)] == []
+    assert all(inspect.iscoroutinefunction(d.dependency) for d in app.router.dependencies)
+
+    # the engine really is entered from one thread only, however many requests arrive at once
+    seen = set()
+    original = rig.engine.status
+    rig.engine.status = lambda: (seen.add(threading.get_ident()), original())[1]
+    with TestClient(app) as c:
+        threads = [threading.Thread(target=lambda: [c.get("/api/status") for _ in range(15)]) for _ in range(6)]
+        [th.start() for th in threads]
+        [th.join() for th in threads]
+    assert len(seen) == 1

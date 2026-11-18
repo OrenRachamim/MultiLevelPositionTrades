@@ -347,10 +347,16 @@ async function loadCharts() {
   }
   if (benchSel.value !== benchChoice(d.symbol)) benchSel.value = benchChoice(d.symbol);
   benchSel.options[0].textContent = d.benchmark && d.benchmark.auto ? `אוטומטי (${d.benchmark.symbol})` : "אוטומטי";
-  $("#key-bench-wrap").hidden = !bench;
+  $("#key-bench-wrap").hidden = !d.benchmark || !bars.length;
   if (bench) {
     const why = bench.corr != null ? `מתאם ${bench.corr.toFixed(2)}` : "אין עדיין מספיק נתונים למתאם";
     $("#key-bench").textContent = `${bench.symbol} · ${bench.name} (${why}) – מותאם למחיר המניה בתחילת התצוגה`;
+    $("#key-bench").className = "";
+  } else if (d.benchmark) {
+    $("#key-bench").textContent = d.benchmark.points.length
+      ? `${d.benchmark.symbol}: לנרות המדד אין זמנים משותפים עם נרות המניה בתצוגה הזו`
+      : `${d.benchmark.symbol}: אין נרות של המדד בטווח הזה. הם נאספים מרגע עדכון המערכת (בדוק בלוג אם IBKR דחה את ${d.benchmark.symbol}); לימים קודמים: ״הורד נרות מ-IBKR״ בלשונית Backtest`;
+    $("#key-bench").className = "msg-warn";
   }
   attach("macd", d.macd); attach("signal", d.macd_signal); attach("hist", d.macd_hist);
   lastChart = { ...d, bars, byTime, bench };

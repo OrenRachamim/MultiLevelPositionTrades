@@ -1,4 +1,10 @@
-"""Dashboard HTTP API. Runs in the same event loop as the engine."""
+"""Dashboard HTTP API. Runs in the same event loop as the engine.
+
+Every handler is ``async def`` on purpose. FastAPI runs plain ``def`` handlers
+in worker threads, and the engine with its SQLite connection is not thread
+safe: a worker thread and the engine running the same query at once get each
+other's rows. On the event loop a handler and the engine can never interleave.
+"""
 
 from __future__ import annotations
 
@@ -97,7 +103,7 @@ def asset_version() -> str:
 def create_app(engine: Engine, cfg: Config) -> FastAPI:
     security = HTTPBasic(auto_error=False)
 
-    def auth(creds: Optional[HTTPBasicCredentials] = Depends(security)) -> None:
+    async def auth(creds: Optional[HTTPBasicCredentials] = Depends(security)) -> None:
         if not cfg.web.password:
             return
         ok = creds is not None and secrets.compare_digest(
@@ -123,7 +129,7 @@ def create_app(engine: Engine, cfg: Config) -> FastAPI:
     app.mount("/static", StaticFiles(directory=STATIC), name="static")
 
     @app.get("/")
-    def index() -> HTMLResponse:
+    async def index() -> HTMLResponse:
         # every asset URL carries the version, so an updated page never runs a cached old script
         v = asset_version()
         html = (STATIC / "index.html").read_text(encoding="utf-8")
@@ -132,36 +138,36 @@ def create_app(engine: Engine, cfg: Config) -> FastAPI:
         return HTMLResponse(html, headers={"Cache-Control": "no-store"})
 
     @app.get("/api/status")
-    def status() -> dict[str, Any]:
+    async def status() -> dict[str, Any]:
         return {**engine.status(), "version": __version__, "assets": asset_version(),
                 "telegram": isinstance(engine.notifier, TelegramNotifier),
                 "fatal": getattr(engine.broker, "fatal", None)}
 
     # --- daily list ---------------------------------------------------------
     @app.get("/api/watchlist")
-    def watchlist(date: str = "") -> dict[str, Any]:
+    async def watchlist(date: str = "") -> dict[str, Any]:
         date = date or engine.now_et().date().isoformat()
         return {"date": date, "items": engine.watchlist_view(date), "dates": engine.store.watch_dates()}
 
     @app.post("/api/watchlist")
-    def watchlist_upload(body: WatchlistIn) -> dict[str, Any]:
+    async def watchlist_upload(body: WatchlistIn) -> dict[str, Any]:
         if len(body.text) > 200_000:
             raise HTTPException(413, "הרשימה גדולה מדי")
         return engine.load_watchlist(body.date, body.text, body.replace)
 
     @app.delete("/api/watchlist/{watch_id}")
-    def watchlist_delete(watch_id: int) -> dict[str, Any]:
+    async def watchlist_delete(watch_id: int) -> dict[str, Any]:
         ok, msg = engine.remove_watch(watch_id)
         return {"ok": ok, "message": msg}
 
     @app.get("/api/watchlist/template")
-    def watchlist_template() -> PlainTextResponse:
+    async def watchlist_template() -> PlainTextResponse:
         return PlainTextResponse(TEMPLATE, media_type="text/csv", headers={
             "Content-Disposition": 'attachment; filename="watchlist_template.csv"'})
 
     # --- positions ----------------------------------------------------------
     @app.get("/api/positions")
-    def positions(which: str = "open") -> dict[str, Any]:
+    async def positions(which: str = "open") -> dict[str, Any]:
         if which not in ("open", "closed"):
             raise HTTPException(400, "which must be open or closed")
         rows = engine.positions_view(which)
@@ -171,17 +177,17 @@ def create_app(engine: Engine, cfg: Config) -> FastAPI:
         return out
 
     @app.post("/api/positions/{pos_id}/close")
-    def position_close(pos_id: int) -> dict[str, Any]:
+    async def position_close(pos_id: int) -> dict[str, Any]:
         ok, msg = engine.request_close(pos_id)
         return {"ok": ok, "message": msg}
 
     @app.get("/api/positions/{pos_id}/orders")
-    def position_orders(pos_id: int) -> dict[str, Any]:
+    async def position_orders(pos_id: int) -> dict[str, Any]:
         return {"items": engine.store.orders_for_position(pos_id)}
 
     # --- charts -------------------------------------------------------------
     @app.get("/api/symbols")
-    def symbols(date: str = "") -> dict[str, Any]:
+    async def symbols(date: str = "") -> dict[str, Any]:
         date = date or engine.now_et().date().isoformat()
         try:
             day = dt.date.fromisoformat(date)
@@ -199,7 +205,7 @@ def create_app(engine: Engine, cfg: Config) -> FastAPI:
             {"symbol": b, "name": engine.BENCHMARK_NAMES.get(b, b)} for b in engine.settings.benchmark_list()]}
 
     @app.get("/api/chart")
-    def chart(symbol: str, date: str = "", days: int = 1, tf: int = 1, bench: str = "auto") -> dict[str, Any]:
+    async def chart(symbol: str, date: str = "", days: int = 1, tf: int = 1, bench: str = "auto") -> dict[str, Any]:
         date = date or engine.now_et().date().isoformat()
         try:
             return engine.chart(symbol.upper(), date, days, tf, bench)
@@ -207,7 +213,7 @@ def create_app(engine: Engine, cfg: Config) -> FastAPI:
             raise HTTPException(400, "bad date") from None
 
     @app.get("/api/explain")
-    def explain(symbol: str, date: str = "") -> dict[str, Any]:
+    async def explain(symbol: str, date: str = "") -> dict[str, Any]:
         date = date or engine.now_et().date().isoformat()
         try:
             return engine.explain(symbol.upper(), date)
@@ -219,12 +225,12 @@ def create_app(engine: Engine, cfg: Config) -> FastAPI:
     source = cfg.mode          # the database that holds this dashboard's bars and lists
 
     @app.get("/api/backtest")
-    def backtest_status() -> dict[str, Any]:
+    async def backtest_status() -> dict[str, Any]:
         return {**jobs.status(), "source": source, "can_download": cfg.mode in ("paper", "live"),
                 "settings": engine.settings.to_dict()}
 
     @app.post("/api/backtest/run")
-    def backtest_run(body: BacktestIn) -> dict[str, Any]:
+    async def backtest_run(body: BacktestIn) -> dict[str, Any]:
         first, last = _dates(body.first, body.last)
         args = ["backtest", "--from", first, "--to", last, "--source", source, "--cash", str(body.cash),
                 "--json", str(jobs.result_path), "--db-name", "backtest"]
@@ -260,7 +266,7 @@ def create_app(engine: Engine, cfg: Config) -> FastAPI:
         return {"ok": ok, "message": msg}
 
     @app.post("/api/backtest/download")
-    def backtest_download(body: DownloadIn) -> dict[str, Any]:
+    async def backtest_download(body: DownloadIn) -> dict[str, Any]:
         if cfg.mode not in ("paper", "live"):
             return {"ok": False, "message": "הורדת נרות זמינה רק כשהמערכת מחוברת ל-IBKR (לא בסימולציה)"}
         first, last = _dates(body.first, body.last)
@@ -274,22 +280,22 @@ def create_app(engine: Engine, cfg: Config) -> FastAPI:
         return {"ok": ok, "message": msg}
 
     @app.post("/api/backtest/cancel")
-    def backtest_cancel() -> dict[str, Any]:
+    async def backtest_cancel() -> dict[str, Any]:
         ok, msg = jobs.cancel()
         return {"ok": ok, "message": msg}
 
     # --- log ----------------------------------------------------------------
     @app.get("/api/events")
-    def events(limit: int = 200, after_id: int = 0, symbol: str = "", level: str = "") -> dict[str, Any]:
+    async def events(limit: int = 200, after_id: int = 0, symbol: str = "", level: str = "") -> dict[str, Any]:
         return {"items": engine.store.events(min(max(limit, 1), 1000), after_id, symbol.upper(), level.upper())}
 
     # --- settings -----------------------------------------------------------
     @app.get("/api/settings")
-    def settings() -> dict[str, Any]:
+    async def settings() -> dict[str, Any]:
         return {"settings": engine.settings.to_dict(), "strategies": sorted(STRATEGIES)}
 
     @app.put("/api/settings")
-    def settings_update(changes: dict[str, Any]) -> dict[str, Any]:
+    async def settings_update(changes: dict[str, Any]) -> dict[str, Any]:
         try:
             new = engine.update_settings(changes)
         except ValueError as e:
@@ -297,7 +303,7 @@ def create_app(engine: Engine, cfg: Config) -> FastAPI:
         return {"settings": new.to_dict()}
 
     @app.post("/api/trading")
-    def trading(body: TradingIn) -> dict[str, Any]:
+    async def trading(body: TradingIn) -> dict[str, Any]:
         engine.set_trading(body.enabled)
         return {"trading_enabled": engine.settings.trading_enabled}
 
