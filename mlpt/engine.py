@@ -944,6 +944,7 @@ class Engine:
 
     def position_view(self, p: dict[str, Any]) -> dict[str, Any]:
         row = dict(p)
+        row["chart_date"], row["chart_days"] = self._chart_span(p)
         if p["state"] in HOLDING_STATES:
             last = self.last.get(p["symbol"])
             row["last"] = last
@@ -967,6 +968,12 @@ class Engine:
         highs = [b.high for b in bars] + ([live.high] if live is not None and live.rth else [])
         best = max(highs) * (1 - p["trail_pct"] / 100) if highs else 0.0
         return max(p["trail_stop"], round_price(best))
+
+    def _chart_span(self, p: dict[str, Any]) -> tuple[str, int]:
+        """(last date, number of trading days) of a chart that shows the whole trade."""
+        entry_day = dt.date.fromisoformat(p["trade_date"])
+        last = to_et(p["exit_time"]).date() if p["exit_time"] else self.now_et().date()
+        return last.isoformat(), 1 + self.calendar.trading_days_between(entry_day, max(last, entry_day))
 
     def positions_view(self, which: str = "open") -> list[dict[str, Any]]:
         if which == "open":
@@ -1020,17 +1027,64 @@ class Engine:
                        for e in self.store.events_between(symbol, start, end)],
         }
 
-    def chart(self, symbol: str, trade_date: str) -> dict[str, Any]:
-        """Bars, moving averages, MACD and trade markers of one stock for one ET date."""
+    CHART_TIMEFRAMES = (1, 5, 15, 30, 60)      # minutes per candle
+    CHART_MAX_BARS = 5000
+
+    def _bucket(self, ts: int, tf: int) -> int:
+        """Start of the ``tf``-minute candle that contains ``ts``; candles are aligned to the 09:30 open."""
+        if tf <= 1:
+            return ts
+        t = to_et(ts)
+        anchor = int(dt.datetime.combine(t.date(), dt.time(9, 30), tzinfo=ET).timestamp())
+        return anchor + (ts - anchor) // (tf * 60) * (tf * 60)
+
+    def _aggregate(self, bars: list[Bar], tf: int) -> list[Bar]:
+        """One-minute bars -> ``tf``-minute candles. Regular and extended hours never share a candle."""
+        if tf <= 1:
+            return bars
+        out: list[Bar] = []
+        key = None
+        for b in bars:
+            k = (self._bucket(b.ts, tf), b.rth)
+            if k != key:
+                key = k
+                # stamped with the start of its slot; the second half of a slot that the open or
+                # the close splits in two starts at its own first bar, so times stay unique
+                start = k[0] if not out or k[0] > out[-1].ts else b.ts
+                out.append(Bar(start, b.open, b.high, b.low, b.close, b.volume, b.rth))
+            else:
+                c = out[-1]
+                c.high, c.low, c.close, c.volume = max(c.high, b.high), min(c.low, b.low), b.close, c.volume + b.volume
+        return out
+
+    def chart(self, symbol: str, trade_date: str, days: int = 1, tf: int = 1) -> dict[str, Any]:
+        """Candles, moving averages, MACD and trade markers of one stock.
+
+        ``days`` trading days ending at ``trade_date``, in ``tf``-minute candles
+        built from the stored one-minute bars. The indicators are computed on
+        the candles that are shown; only the one-minute view is what the entry
+        strategy itself sees.
+        """
         st = self.settings
         day = dt.date.fromisoformat(trade_date)
-        start = int(dt.datetime.combine(day, dt.time(0), tzinfo=ET).timestamp())
+        days = max(1, min(int(days), 60))
+        if tf not in self.CHART_TIMEFRAMES:
+            tf = 1
+        # keep the payload bounded: a long range is not served in one-minute candles
+        tf = next(t for t in self.CHART_TIMEFRAMES if t >= tf and (days * 960 / t <= self.CHART_MAX_BARS or t == 60))
+        first = day
+        for _ in range(days - 1):
+            first -= dt.timedelta(days=1)
+            while not self.calendar.is_trading_day(first):
+                first -= dt.timedelta(days=1)
+        start = int(dt.datetime.combine(first, dt.time(0), tzinfo=ET).timestamp())
         end = int(dt.datetime.combine(day + dt.timedelta(days=1), dt.time(0), tzinfo=ET).timestamp())
-        warm = self.store.bars(symbol, start - 6 * 86400, start)[-600:]
-        bars = self.store.bars(symbol, start, end)
+        warm = self._aggregate(self.store.bars(symbol, start - (6 + tf // 4) * 86400, start), tf)[-600:]
+        minute = self.store.bars(symbol, start, end)
         live = self.live.get(symbol)
-        if live is not None and start <= live.ts < end and (not bars or live.ts > bars[-1].ts):
-            bars = bars + [live]
+        if live is not None and start <= live.ts < end and (not minute or live.ts > minute[-1].ts):
+            minute = minute + [live]
+        bars = self._aggregate(minute, tf)
 
         def shift(ts: int) -> int:           # chart axis shows New York wall-clock time
             return ts + int(to_et(ts).utcoffset().total_seconds())   # type: ignore[union-attr]
@@ -1052,13 +1106,19 @@ class Engine:
 
         ma_fast, ma_slow = points(fast), points(slow)
 
+        stamps = [b.ts for b in bars]
+
+        def candle(ts: int) -> int:          # the candle on screen that contains this moment
+            i = bisect.bisect_right(stamps, ts) - 1
+            return shift(stamps[i] if i >= 0 else ts // 60 * 60)
+
         markers, levels = [], []
         for p in self.store.pos_for_symbol(symbol, start, end):
             if start <= p["entry_time"] < end:
-                markers.append({"time": shift(p["entry_time"] // 60 * 60), "kind": "entry",
+                markers.append({"time": candle(p["entry_time"]), "kind": "entry",
                                 "text": f"BUY {p['entry_price']:.2f}"})
             if p["exit_time"] and start <= p["exit_time"] < end:
-                markers.append({"time": shift(p["exit_time"] // 60 * 60), "kind": "exit",
+                markers.append({"time": candle(p["exit_time"]), "kind": "exit",
                                 "win": (p["pnl"] or 0) >= 0,
                                 "text": f"SELL {p['exit_price']:.2f} {p['exit_reason']}"})
             if p["state"] in HOLDING_STATES:
@@ -1069,7 +1129,7 @@ class Engine:
                 else:
                     levels += [{"kind": "tp", "price": p["tp_price"]}, {"kind": "sl", "price": p["sl_price"]}]
         return {
-            "symbol": symbol, "date": trade_date,
+            "symbol": symbol, "date": trade_date, "days": days, "tf": tf, "first": first.isoformat(),
             "bars": [{"time": shift(b.ts), "open": b.open, "high": b.high, "low": b.low,
                       "close": b.close, "volume": b.volume, "rth": b.rth} for b in bars],
             "ma_fast": ma_fast, "ma_slow": ma_slow,

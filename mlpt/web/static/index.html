@@ -58,10 +58,22 @@
   <section id="tab-charts" class="tab" hidden>
     <div class="panel">
       <div class="toolbar">
-        <label>תאריך <input type="date" id="chart-date"></label>
+        <label>עד תאריך <input type="date" id="chart-date"></label>
+        <label>טווח
+          <select id="chart-days">
+            <option value="1">יום אחד</option><option value="2">יומיים</option><option value="3">3 ימים</option>
+            <option value="5">5 ימים</option><option value="7">7 ימים</option><option value="10">10 ימים</option><option value="20">20 ימים</option>
+          </select>
+        </label>
+        <label>נר
+          <select id="chart-tf">
+            <option value="1">דקה</option><option value="5">5 דק׳</option><option value="15">15 דק׳</option>
+            <option value="30">30 דק׳</option><option value="60">שעה</option>
+          </select>
+        </label>
         <div id="chart-symbols" class="chips"></div>
         <label class="check"><input type="checkbox" id="chart-ext" checked> מסחר מורחב (לפני/אחרי)</label>
-        <button id="chart-reset" class="btn small ghost" title="התאמת הצירים לכל הנרות של היום">התאם תצוגה</button>
+        <button id="chart-reset" class="btn small ghost" title="התאמת הצירים לכל הנרות שבטווח">התאם תצוגה</button>
         <span id="chart-info" class="muted"></span>
       </div>
       <div class="chart-wrap">

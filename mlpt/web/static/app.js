@@ -46,7 +46,10 @@ function table(el, head, rows, empty) {
 // version of the files this page was loaded with; the server reports the current one
 const ASSETS = new URL(document.currentScript.src, location.href).searchParams.get("v");
 
-const state = { tab: "overview", status: null, chartSymbol: null, chartDate: null, listDate: null, settingsLoaded: false, busy: false };
+const state = { tab: "overview", status: null, chartSymbol: null, chartDate: null, chartDays: 1, chartTf: 1, listDate: null, settingsLoaded: false, busy: false };
+const TF_LABEL = { 1: "דקה", 5: "5 דק׳", 15: "15 דק׳", 30: "30 דק׳", 60: "שעה" };
+// candle size that keeps a multi-day chart readable; the user can still pick another
+const autoTf = (days) => days <= 1 ? 1 : days <= 3 ? 5 : days <= 10 ? 15 : 30;
 
 // --------------------------------------------------------------------- header
 function renderStatus(s) {
@@ -141,7 +144,7 @@ async function loadOverview() {
         <td class="num">${p.trail_stop_now != null ? "–" : usd(p.tp_price)}</td>
         <td class="num" title="${p.trail_stop_now != null ? "הערכה: הסטופ הנגרר זז אצל IBKR" : ""}">${p.trail_stop_now != null ? "≈ " + usd(p.trail_stop_now) : usd(p.sl_price)}</td>
         <td class="num">${p.days_held ?? "–"}</td><td>${guard}</td>
-        <td><button class="btn small ghost" data-chart="${esc(p.symbol)}">גרף</button>
+        <td><button class="btn small ghost" data-chart="${esc(p.symbol)}" data-days="${p.chart_days}">גרף</button>
         ${p.state !== "ENTERING" ? `<button class="btn small danger" data-close="${p.id}" data-sym="${esc(p.symbol)}">סגור</button>` : ""}</td></tr>`;
     }), "אין פוזיציות פתוחות");
   $("#today-date").textContent = wl.date;
@@ -155,6 +158,10 @@ document.addEventListener("click", async (e) => {
   if (t.dataset.chart) {
     state.chartSymbol = t.dataset.chart;
     state.chartDate = t.dataset.date || (state.tab === "list" ? state.listDate : null);
+    const span = Number(t.dataset.days) || 1;                         // a trade opens on its whole holding period
+    state.chartDays = [1, 2, 3, 5, 7, 10, 20].find((o) => o >= span) || 20;
+    state.chartTf = autoTf(state.chartDays);
+    chartKey = "";
     location.hash = "#charts";
   } else if (t.dataset.close) {
     if (!confirm(`לסגור את הפוזיציה ב-${t.dataset.sym} עכשיו במחיר שוק?`)) return;
@@ -171,7 +178,7 @@ document.addEventListener("click", async (e) => {
 // --------------------------------------------------------------------- charts
 let chart = null, candles = null, maFast = null, maSlow = null, priceLines = [], chartKey = "", lastChart = null;
 let macdChart = null, macdHist = null, macdLine = null, macdSignal = null;
-let chartSeq = 0, chartHadData = false, syncPaused = false;
+let chartSeq = 0, chartHadData = false, syncPaused = false, chartAge = 0;
 let whyKey = "", whyAge = 0, whyData = null;
 
 // "Why was / wasn't there an entry": every trigger of the strategy that day with the verdict of the rules.
@@ -268,20 +275,27 @@ function renderLegend(time) {
   const row = d.byTime.get(time) || d.byTime.get(d.bars[d.bars.length - 1].time);
   const bar = row.bar, n = (v, k = 2) => v.toFixed(k);
   const tag = (color, text) => `<span style="border-bottom:2px solid ${cssVar(color)}">${text}</span>`;
-  const hhmm = new Date(bar.time * 1000).toISOString().slice(11, 16);
+  const iso = new Date(bar.time * 1000).toISOString();
+  const hhmm = d.days > 1 ? `${iso.slice(5, 10)} ${iso.slice(11, 16)}` : iso.slice(11, 16);
   $("#chart-legend").innerHTML = `<b>${esc(d.symbol)}</b><span>${hhmm} NY${bar.rth === false ? " (ext)" : ""}</span>
     <span>O ${n(bar.open)}</span><span>H ${n(bar.high)}</span><span>L ${n(bar.low)}</span><span>C ${n(bar.close)}</span>
     ${bar.volume != null ? `<span>Vol ${Number(bar.volume).toLocaleString("en-US")}</span>` : ""}
     ${row.fast != null ? tag("--ma-fast", `${esc(d.ma_labels[0])} ${n(row.fast)}`) : ""}
     ${row.slow != null ? tag("--ma-slow", `${esc(d.ma_labels[1])} ${n(row.slow)}`) : ""}
     ${d.levels.map((l) => `<span>${{ entry: "Entry", tp: "TP", sl: "SL", trail: "Trail ≈" }[l.kind]} ${n(l.price)}</span>`).join("")}`;
-  $("#macd-legend").innerHTML = `<b>${esc(d.macd_label)}</b>` + (row.macd == null ? "<span>–</span>"
+  $("#macd-legend").innerHTML = `<b>${esc(d.macd_label)}</b>`
+    + (d.tf > 1 ? `<span>on ${d.tf}-min candles (the entry strategy uses 1-min)</span>` : "") + (row.macd == null ? "<span>–</span>"
     : `${tag("--ma-fast", `MACD ${n(row.macd, 3)}`)}${row.signal != null ? tag("--ma-slow", `Signal ${n(row.signal, 3)}`) : ""}
        ${row.hist != null ? `<span>Hist ${n(row.hist, 3)}</span>` : ""}`);
 }
 
 async function loadCharts() {
+  // a multi-day chart is heavier and changes slowly: the timer refreshes it every 10 seconds
+  if (state.chartDays > 1 && chartKey && ++chartAge < 5) return;
+  chartAge = 0;
   const seq = ++chartSeq;          // a newer request (click or timer) makes this one stale
+  $("#chart-days").value = String(state.chartDays);
+  $("#chart-tf").value = String(state.chartTf);
   const dateInput = $("#chart-date");
   if (!state.chartDate) state.chartDate = state.status.today;
   if (dateInput.value !== state.chartDate) dateInput.value = state.chartDate;
@@ -292,8 +306,8 @@ async function loadCharts() {
     || '<span class="muted">אין מניות לתאריך הזה</span>';
   ensureChart();
   const d = state.chartSymbol
-    ? await api(`/api/chart?symbol=${encodeURIComponent(state.chartSymbol)}&date=${state.chartDate}`)
-    : { symbol: "", date: state.chartDate, bars: [], ma_fast: [], ma_slow: [], macd: [], macd_signal: [], macd_hist: [], markers: [], levels: [], ma_labels: ["", ""], macd_label: "MACD" };
+    ? await api(`/api/chart?symbol=${encodeURIComponent(state.chartSymbol)}&date=${state.chartDate}&days=${state.chartDays}&tf=${state.chartTf}`)
+    : { symbol: "", date: state.chartDate, days: state.chartDays, tf: state.chartTf, bars: [], ma_fast: [], ma_slow: [], macd: [], macd_signal: [], macd_hist: [], markers: [], levels: [], ma_labels: ["", ""], macd_label: "MACD" };
   if (seq !== chartSeq) return;
   const ext = $("#chart-ext").checked, extColor = cssVar("--ext");
   const bars = d.bars.filter((b) => ext || b.rth).map((b) => b.rth ? b
@@ -353,9 +367,10 @@ async function loadCharts() {
   }
   const last = bars[bars.length - 1];
   $("#chart-info").textContent = bars.length
-    ? `${bars.length} נרות · אחרון ${new Date(last.time * 1000).toISOString().slice(11, 16)} · ${last.close.toFixed(2)}` : "";
+    ? `${bars.length} נרות של ${TF_LABEL[d.tf] || d.tf}${d.days > 1 ? ` · מ-${d.first}` : ""} · אחרון ${new Date(last.time * 1000).toISOString().slice(11, 16)} · ${last.close.toFixed(2)}` : "";
+  if (d.tf !== state.chartTf) { state.chartTf = d.tf; $("#chart-tf").value = String(d.tf); }   // the server widens candles on long ranges
   // a new stock, date or bar set - or the first bars of an empty chart - always gets a fresh view
-  const key = `${d.symbol}|${d.date}|${ext}`;
+  const key = `${d.symbol}|${d.date}|${ext}|${d.days}|${d.tf}`;
   if (key !== chartKey || (bars.length > 0 && !chartHadData)) { chartKey = key; resetChartView(); }
   chartHadData = bars.length > 0;
   renderLegend(null);
@@ -364,7 +379,9 @@ $("#chart-reset").addEventListener("click", resetChartView);
 // choosing a stock or a date - even the one already shown - always re-fits the view
 $("#chart-symbols").addEventListener("click", (e) => { const b = e.target.closest("button"); if (b) { state.chartSymbol = b.dataset.sym; chartKey = ""; loadCharts(); } });
 $("#chart-date").addEventListener("change", (e) => { state.chartDate = e.target.value || null; chartKey = ""; loadCharts(); });
-$("#chart-ext").addEventListener("change", loadCharts);
+$("#chart-ext").addEventListener("change", () => { chartKey = ""; loadCharts(); });
+$("#chart-days").addEventListener("change", (e) => { state.chartDays = Number(e.target.value); state.chartTf = autoTf(state.chartDays); chartKey = ""; loadCharts(); });
+$("#chart-tf").addEventListener("change", (e) => { state.chartTf = Number(e.target.value); chartKey = ""; loadCharts(); });
 
 // ----------------------------------------------------------------- daily list
 async function loadList() {
@@ -415,7 +432,7 @@ async function loadHistory() {
       <td class="num">${usd(p.entry_price)}</td><td class="num">${usd(p.exit_price)}</td>
       <td class="num ${cls(p.pnl)}">${signed(p.pnl)}</td><td class="num ${cls(p.pnl_pct)}">${pct(p.pnl_pct)}</td><td class="num">${usd(p.commission)}</td>
       <td>${PHASE[p.exit_phase] || esc(p.exit_phase)}</td><td>${REASON[p.exit_reason] || esc(p.exit_reason)}</td><td class="num">${nyTime(p.exit_time)}</td>
-      <td><button class="btn small ghost" data-chart="${esc(p.symbol)}" data-date="${esc(p.trade_date)}">גרף</button></td></tr>`),
+      <td><button class="btn small ghost" data-chart="${esc(p.symbol)}" data-date="${esc(p.chart_date)}" data-days="${p.chart_days}">גרף</button></td></tr>`),
     "עדיין אין עסקאות סגורות");
 }
 

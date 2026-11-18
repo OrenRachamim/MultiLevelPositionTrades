@@ -506,3 +506,55 @@ def test_trailing_setting_applies_to_new_entries_only(rig: Rig):
     msft = next(p for p in rig.positions() if p["symbol"] == "MSFT")
     assert msft["trail_pct"] == 0.3
     assert sorted(o["role"] for o in rig.working() if o["symbol"] == "MSFT") == [ROLE_SL]
+
+
+# ------------------------------------------------------- multi-day / larger candles
+def test_chart_over_several_days_in_larger_candles(rig: Rig):
+    from mlpt.models import Bar
+
+    def minute_bars(day, hh, mm, n, base, rth=True):
+        t0 = ts(day, hh, mm)
+        return [Bar(t0 + i * 60, base + i, base + i + 0.5, base + i - 0.5, base + i + 0.2, 10, rth) for i in range(n)]
+
+    rig.store.save_bars("AAPL", minute_bars(D1, 9, 20, 10, 50, rth=False) + minute_bars(D1, 9, 30, 15, 100)
+                        + minute_bars(D2, 9, 30, 10, 200))
+    one = rig.engine.chart("AAPL", D2.isoformat())
+    assert (one["days"], one["tf"], one["first"], len(one["bars"])) == (1, 1, D2.isoformat(), 10)
+
+    c = rig.engine.chart("AAPL", D2.isoformat(), days=2, tf=5)
+    assert (c["days"], c["tf"], c["first"]) == (2, 5, D1.isoformat())
+    assert [(b["time"] % 86400 // 60, b["rth"]) for b in c["bars"]] == [
+        (9 * 60 + 20, False), (9 * 60 + 25, False),                         # pre-market candles stay separate
+        (9 * 60 + 30, True), (9 * 60 + 35, True), (9 * 60 + 40, True),      # day 1
+        (9 * 60 + 30, True), (9 * 60 + 35, True)]                           # day 2: the overnight gap is skipped
+    first_rth = c["bars"][2]
+    assert (first_rth["open"], first_rth["high"], first_rth["low"], first_rth["close"], first_rth["volume"]) == \
+        (100, 104.5, 99.5, 104.2, 50)                                       # 09:30-09:34 folded into one candle
+    hour = rig.engine.chart("AAPL", D1.isoformat(), tf=60)
+    assert [(b["time"] % 86400 // 60, b["rth"], b["volume"]) for b in hour["bars"]] == \
+        [(8 * 60 + 30, False, 100), (9 * 60 + 30, True, 150)]               # the 09:30 open starts a new candle
+    rig.store.save_bars("AAPL", minute_bars(D1, 15, 50, 20, 300, rth=True)[:10] + minute_bars(D1, 16, 0, 10, 310, rth=False))
+    late = [b for b in rig.engine.chart("AAPL", D1.isoformat(), tf=60)["bars"] if b["time"] % 86400 >= 15 * 3600]
+    assert [(b["time"] % 86400 // 60, b["rth"]) for b in late] == [(15 * 60 + 30, True), (16 * 60, False)]
+    stamps = [b["time"] for b in rig.engine.chart("AAPL", D2.isoformat(), days=2, tf=60)["bars"]]
+    assert stamps == sorted(set(stamps))                                    # strictly increasing, as the chart needs
+    assert rig.engine.chart("AAPL", D2.isoformat(), days=20, tf=1)["tf"] == 5      # long ranges get wider candles
+    assert rig.engine.chart("AAPL", D2.isoformat(), days=2, tf=7)["tf"] == 1       # unknown size: one minute
+
+
+def test_chart_of_a_swing_trade_spans_its_holding_period(rig: Rig):
+    rig.load("symbol\nAAPL")
+    enter(rig)                                                               # fills in the 09:36 bar of day 1
+    rig.step(ts(D1, 20, 1))
+    rig.step(ts(D2, 9, 30), "AAPL", 100.4)
+    pos = rig.engine.positions_view("open")[0]
+    assert pos["state"] == SWING and (pos["chart_date"], pos["chart_days"]) == (D2.isoformat(), 2)
+    c = rig.engine.chart("AAPL", pos["chart_date"], days=pos["chart_days"], tf=15)
+    assert [m["kind"] for m in c["markers"]] == ["entry"]
+    assert c["markers"][0]["time"] == c["bars"][0]["time"]                   # drawn on the candle that contains it
+    assert [lv["kind"] for lv in c["levels"]] == ["entry", "tp", "sl"] and c["levels"][1]["price"] == 105.0
+    rig.step(ts(D2, 10, 0), "AAPL", 105.3)
+    closed = rig.engine.positions_view("closed")[0]
+    assert (closed["chart_date"], closed["chart_days"]) == (D2.isoformat(), 2)
+    c = rig.engine.chart("AAPL", closed["chart_date"], days=2, tf=15)
+    assert [m["kind"] for m in c["markers"]] == ["entry", "exit"] and c["levels"] == []

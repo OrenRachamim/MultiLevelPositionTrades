@@ -196,10 +196,10 @@ def create_app(engine: Engine, cfg: Config) -> FastAPI:
         return {"date": date, "symbols": ordered}
 
     @app.get("/api/chart")
-    def chart(symbol: str, date: str = "") -> dict[str, Any]:
+    def chart(symbol: str, date: str = "", days: int = 1, tf: int = 1) -> dict[str, Any]:
         date = date or engine.now_et().date().isoformat()
         try:
-            return engine.chart(symbol.upper(), date)
+            return engine.chart(symbol.upper(), date, days, tf)
         except ValueError:
             raise HTTPException(400, "bad date") from None
 
