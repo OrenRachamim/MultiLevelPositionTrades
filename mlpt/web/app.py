@@ -192,14 +192,17 @@ def create_app(engine: Engine, cfg: Config) -> FastAPI:
         with_bars = engine.store.bar_symbols(start, end)
         listed = [w["symbol"] for w in engine.store.watch_for_date(date)]
         held = [p["symbol"] for p in engine.store.pos_in_states(OPEN_STATES)]
-        ordered = list(dict.fromkeys(held + listed + with_bars))
-        return {"date": date, "symbols": ordered}
+        # the comparison indexes are collected for the overlay; they are not stocks to browse
+        marks = set(engine.settings.benchmark_list()) - set(held) - set(listed)
+        ordered = [s for s in dict.fromkeys(held + listed + with_bars) if s not in marks]
+        return {"date": date, "symbols": ordered, "benchmarks": [
+            {"symbol": b, "name": engine.BENCHMARK_NAMES.get(b, b)} for b in engine.settings.benchmark_list()]}
 
     @app.get("/api/chart")
-    def chart(symbol: str, date: str = "", days: int = 1, tf: int = 1) -> dict[str, Any]:
+    def chart(symbol: str, date: str = "", days: int = 1, tf: int = 1, bench: str = "auto") -> dict[str, Any]:
         date = date or engine.now_et().date().isoformat()
         try:
-            return engine.chart(symbol.upper(), date, days, tf)
+            return engine.chart(symbol.upper(), date, days, tf, bench)
         except ValueError:
             raise HTTPException(400, "bad date") from None
 

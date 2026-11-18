@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import datetime as dt
+
+import pytest
 from conftest import D1, D2, D3, Rig, ts
 
 from mlpt.models import (CANCELLED, CLOSED, INTRADAY, O_SUBMITTED, ROLE_SL, ROLE_TP, SWING, W_ENTERED,
@@ -558,3 +561,65 @@ def test_chart_of_a_swing_trade_spans_its_holding_period(rig: Rig):
     assert (closed["chart_date"], closed["chart_days"]) == (D2.isoformat(), 2)
     c = rig.engine.chart("AAPL", closed["chart_date"], days=2, tf=15)
     assert [m["kind"] for m in c["markers"]] == ["entry", "exit"] and c["levels"] == []
+
+
+# ------------------------------------------------------------- comparison index
+def test_index_is_chosen_by_correlation_and_added_to_the_chart(rig: Rig):
+    import math
+    import random
+    from mlpt.models import Bar
+
+    rng = random.Random(3)
+    price = {"AAPL": 100.0, "SPY": 500.0, "QQQ": 400.0, "DIA": 300.0, "IWM": 200.0}
+    bars = {s: [] for s in price}
+    for day in (dt.date(2026, 11, 9), D1):
+        for i in range(390):
+            t = ts(day, 9, 30) + i * 60
+            tech, broad = rng.gauss(0, 0.001), rng.gauss(0, 0.001)
+            move = {"AAPL": tech + rng.gauss(0, 0.0003), "QQQ": tech + rng.gauss(0, 0.0002),
+                    "SPY": broad, "DIA": broad + rng.gauss(0, 0.0003), "IWM": rng.gauss(0, 0.001)}
+            for s in price:
+                price[s] *= math.exp(move[s])
+                bars[s].append(Bar(t, price[s], price[s], price[s], price[s], 100, True))
+    for s, series in bars.items():
+        rig.store.save_bars(s, series)
+
+    pick = rig.engine.benchmark_for("AAPL", D1)
+    assert pick["symbol"] == "QQQ" and pick["by_correlation"]
+    corr = {c["symbol"]: c["corr"] for c in pick["candidates"]}
+    assert corr["QQQ"] > 0.8 and abs(corr["SPY"]) < 0.3 and all(c["points"] > 100 for c in pick["candidates"])
+
+    c = rig.engine.chart("AAPL", D1.isoformat())
+    b = c["benchmark"]
+    assert (b["symbol"], b["name"], b["auto"]) == ("QQQ", "Nasdaq 100", True) and b["corr"] == corr["QQQ"]
+    assert len(b["points"]) == 390 and b["points"][0]["time"] == c["bars"][0]["time"]
+    assert b["points"][-1]["value"] == bars["QQQ"][-1].close                    # raw closes; the page rebases
+    hourly = rig.engine.chart("AAPL", D1.isoformat(), days=2, tf=60)["benchmark"]
+    assert len(hourly["points"]) == 14                                          # same candles as the stock
+
+    manual = rig.engine.chart("AAPL", D1.isoformat(), bench="DIA")["benchmark"]
+    assert (manual["symbol"], manual["auto"], manual["corr"]) == ("DIA", False, corr["DIA"])
+    assert rig.engine.chart("AAPL", D1.isoformat(), bench="none")["benchmark"] is None
+    assert rig.engine.chart("QQQ", D1.isoformat())["benchmark"] is None         # an index is not compared to itself
+    assert rig.engine.chart("AAPL", D1.isoformat(), bench="XYZ")["benchmark"]["symbol"] == "QQQ"
+
+    # too little history: the first configured index, marked as not chosen by correlation
+    rig.store.save_bars("NEW", bars["AAPL"][:20])
+    weak = rig.engine.chart("NEW", dt.date(2026, 11, 9).isoformat())["benchmark"]
+    assert (weak["symbol"], weak["by_correlation"], weak["corr"]) == ("SPY", False, None)
+    rig.engine.update_settings({"benchmarks": ""})
+    assert rig.engine.chart("AAPL", D1.isoformat())["benchmark"] is None
+
+
+def test_indexes_are_collected_with_the_listed_stocks_only(rig: Rig):
+    assert rig.sim.subscribed == set()                                          # nothing listed: nothing collected
+    rig.load("symbol\nAAPL")
+    assert rig.sim.subscribed == {"AAPL", "SPY", "QQQ", "DIA", "IWM"}
+    rig.step(ts(D1, 9, 35), "SPY", 500.0, signal=True)                          # an index bar is never an entry
+    rig.step(ts(D1, 9, 36), "SPY", 500.0)
+    assert rig.positions() == [] and len(rig.store.bars("SPY")) == 2
+    rig.engine.update_settings({"benchmarks": "QQQ"})
+    rig.engine.tick()
+    assert rig.sim.subscribed == {"AAPL", "QQQ"}
+    with pytest.raises(ValueError):
+        rig.engine.update_settings({"benchmarks": "SPY, $$$"})

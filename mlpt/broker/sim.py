@@ -113,6 +113,12 @@ class SimBroker(Broker):
             bar.rth = self.calendar.is_rth_ts(bar.ts)
             self._match(symbol, bar)
             self.last[symbol] = bar.close
+            # like a real broker's back-fill: a stock subscribed later still gets the recent days
+            hist = self.history.setdefault(symbol, [])
+            if not hist or bar.ts > hist[-1].ts:
+                hist.append(bar)
+                if len(hist) > 4000:
+                    del hist[:1000]
         self.time = ts + 60
         self.flush()
         for symbol, bar in bars.items():
@@ -244,14 +250,18 @@ def synthetic_day(calendar: MarketCalendar, d: dt.date, prices: dict[str, float]
                   rng: random.Random) -> Iterator[Step]:
     """Random-walk bars for one day; ``prices`` is updated in place."""
     drift = {s: rng.uniform(-0.00002, 0.00012) for s in prices}
+    # (market, tech) loadings and own noise, as a share of the bar volatility
+    index = {"SPY": (1.0, 0.0, 0.15), "QQQ": (1.0, 0.9, 0.15), "DIA": (0.9, -0.5, 0.2), "IWM": (1.1, 0.1, 0.5)}
     for ts, rth in session_minutes(calendar, d):
         step: dict[str, Bar] = {}
+        vol = 0.0011 if rth else 0.0005
+        market, tech = rng.gauss(0, vol * 0.45), rng.gauss(0, vol * 0.45)
         for s in prices:
             if not rth and rng.random() < 0.55:       # thin extended-hours tape
                 continue
-            vol = 0.0011 if rth else 0.0005
+            m, t, own = index.get(s, (1.2, 1.0, 0.75))
             o = prices[s]
-            c = o * math.exp(drift[s] + rng.gauss(0, vol))
+            c = o * math.exp(drift[s] * (0.3 if s in index else 1) + m * market + t * tech + rng.gauss(0, vol * own))
             hi = max(o, c) * (1 + abs(rng.gauss(0, vol / 2)))
             lo = min(o, c) * (1 - abs(rng.gauss(0, vol / 2)))
             prices[s] = c

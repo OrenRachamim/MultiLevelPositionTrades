@@ -177,7 +177,11 @@ document.addEventListener("click", async (e) => {
 
 // --------------------------------------------------------------------- charts
 let chart = null, candles = null, maFast = null, maSlow = null, priceLines = [], chartKey = "", lastChart = null;
-let macdChart = null, macdHist = null, macdLine = null, macdSignal = null;
+let macdChart = null, macdHist = null, macdLine = null, macdSignal = null, benchLine = null;
+
+// which index to compare a stock with: remembered per stock in this browser ("auto" = most correlated)
+const benchChoices = (() => { try { return JSON.parse(localStorage.getItem("mlpt-bench") || "{}"); } catch (_) { return {}; } })();
+const benchChoice = (symbol) => benchChoices[symbol] || "auto";
 let chartSeq = 0, chartHadData = false, syncPaused = false, chartAge = 0;
 let whyKey = "", whyAge = 0, whyData = null;
 
@@ -240,6 +244,10 @@ function ensureChart() {
   candles = chart.addCandlestickSeries({ upColor: c.surface, downColor: c.down, borderUpColor: c.up, borderDownColor: c.down, wickUpColor: c.up, wickDownColor: c.down, priceLineVisible: false });
   maFast = line(chart, cssVar("--ma-fast"));
   maSlow = line(chart, cssVar("--ma-slow"));
+  // comparison index: thin, dashed, no axis label, and never part of the auto-scale -
+  // the candles keep the scale they would have without it
+  benchLine = chart.addLineSeries({ color: cssVar("--series-7"), lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dashed,
+    priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false, autoscaleInfoProvider: () => null });
 
   // MACD pane: its own chart, kept in step with the price chart
   macdChart = LightweightCharts.createChart($("#chart-macd"), base(true));
@@ -283,6 +291,14 @@ function renderLegend(time) {
     ${row.fast != null ? tag("--ma-fast", `${esc(d.ma_labels[0])} ${n(row.fast)}`) : ""}
     ${row.slow != null ? tag("--ma-slow", `${esc(d.ma_labels[1])} ${n(row.slow)}`) : ""}
     ${d.levels.map((l) => `<span>${{ entry: "Entry", tp: "TP", sl: "SL", trail: "Trail ≈" }[l.kind]} ${n(l.price)}</span>`).join("")}`;
+  const bm = d.bench;
+  // without a hovered bar, compare at the latest bar the index has (it is thin outside regular hours)
+  const cmp = row.bench != null ? row : time == null && bm ? d.byTime.get(bm.lastTime) : null;
+  if (bm && cmp) {                   // both measured from the same starting bar
+    const index = (cmp.bench / bm.base - 1) * 100, stock = (cmp.bar.close / bm.stockBase - 1) * 100;
+    $("#chart-legend").insertAdjacentHTML("beforeend",
+      `<span style="border-bottom:2px dashed ${cssVar("--series-7")}">${esc(bm.symbol)} ${pct(index)}</span><span>${esc(d.symbol)} ${pct(stock)} (${pct(stock - index)} vs ${esc(bm.symbol)})</span>`);
+  }
   $("#macd-legend").innerHTML = `<b>${esc(d.macd_label)}</b>`
     + (d.tf > 1 ? `<span>on ${d.tf}-min candles (the entry strategy uses 1-min)</span>` : "") + (row.macd == null ? "<span>–</span>"
     : `${tag("--ma-fast", `MACD ${n(row.macd, 3)}`)}${row.signal != null ? tag("--ma-slow", `Signal ${n(row.signal, 3)}`) : ""}
@@ -300,13 +316,18 @@ async function loadCharts() {
   if (!state.chartDate) state.chartDate = state.status.today;
   if (dateInput.value !== state.chartDate) dateInput.value = state.chartDate;
   const sy = await api(`/api/symbols?date=${state.chartDate}`);
+  const benchSel = $("#chart-bench");
+  if (benchSel.options.length !== sy.benchmarks.length + 2) {
+    benchSel.innerHTML = '<option value="auto">אוטומטי</option>'
+      + sy.benchmarks.map((b) => `<option value="${esc(b.symbol)}">${esc(b.symbol)} · ${esc(b.name)}</option>`).join("") + '<option value="none">ללא</option>';
+  }
   if (seq !== chartSeq) return;
   if (!sy.symbols.includes(state.chartSymbol)) state.chartSymbol = sy.symbols[0] || null;
   $("#chart-symbols").innerHTML = sy.symbols.map((s) => `<button data-sym="${esc(s)}" class="${s === state.chartSymbol ? "active" : ""}">${esc(s)}</button>`).join("")
     || '<span class="muted">אין מניות לתאריך הזה</span>';
   ensureChart();
   const d = state.chartSymbol
-    ? await api(`/api/chart?symbol=${encodeURIComponent(state.chartSymbol)}&date=${state.chartDate}&days=${state.chartDays}&tf=${state.chartTf}`)
+    ? await api(`/api/chart?symbol=${encodeURIComponent(state.chartSymbol)}&date=${state.chartDate}&days=${state.chartDays}&tf=${state.chartTf}&bench=${encodeURIComponent(benchChoice(state.chartSymbol))}`)
     : { symbol: "", date: state.chartDate, days: state.chartDays, tf: state.chartTf, bars: [], ma_fast: [], ma_slow: [], macd: [], macd_signal: [], macd_hist: [], markers: [], levels: [], ma_labels: ["", ""], macd_label: "MACD" };
   if (seq !== chartSeq) return;
   const ext = $("#chart-ext").checked, extColor = cssVar("--ext");
@@ -315,8 +336,24 @@ async function loadCharts() {
   const byTime = new Map(bars.map((b) => [b.time, { bar: b }]));
   const attach = (key, points) => points.forEach((p) => { const row = byTime.get(p.time); if (row) row[key] = p.value; });
   attach("fast", d.ma_fast); attach("slow", d.ma_slow);
+  // the index is rebased to the stock's price at the first regular-hours bar on screen that both have:
+  // from there on the dashed line is "where the stock would be had it moved like the index"
+  let bench = null;
+  if (d.benchmark) {
+    attach("bench", d.benchmark.points);
+    const anchor = bars.find((b) => b.rth && byTime.get(b.time).bench != null) || bars.find((b) => byTime.get(b.time).bench != null);
+    const lastBar = [...bars].reverse().find((b) => byTime.get(b.time).bench != null);
+    if (anchor) bench = { ...d.benchmark, base: byTime.get(anchor.time).bench, stockBase: anchor.close, lastTime: lastBar.time };
+  }
+  if (benchSel.value !== benchChoice(d.symbol)) benchSel.value = benchChoice(d.symbol);
+  benchSel.options[0].textContent = d.benchmark && d.benchmark.auto ? `אוטומטי (${d.benchmark.symbol})` : "אוטומטי";
+  $("#key-bench-wrap").hidden = !bench;
+  if (bench) {
+    const why = bench.corr != null ? `מתאם ${bench.corr.toFixed(2)}` : "אין עדיין מספיק נתונים למתאם";
+    $("#key-bench").textContent = `${bench.symbol} · ${bench.name} (${why}) – מותאם למחיר המניה בתחילת התצוגה`;
+  }
   attach("macd", d.macd); attach("signal", d.macd_signal); attach("hist", d.macd_hist);
-  lastChart = { ...d, bars, byTime };
+  lastChart = { ...d, bars, byTime, bench };
   // every series carries every bar time (empty where there is no value) so both panes share one time axis
   const series = (key, extra) => bars.map((b) => {
     const v = byTime.get(b.time)[key];
@@ -325,6 +362,7 @@ async function loadCharts() {
   candles.setData(bars);
   maFast.setData(series("fast"));
   maSlow.setData(series("slow"));
+  benchLine.setData(bench ? series("bench").map((p) => p.value == null ? p : { time: p.time, value: +(p.value * bench.stockBase / bench.base).toFixed(4) }) : []);
   macdLine.setData(series("macd"));
   macdSignal.setData(series("signal"));
   macdHist.setData(series("hist", (v) => ({ color: v >= 0 ? cssVar("--up") + "88" : cssVar("--down") + "88" })));
@@ -381,6 +419,12 @@ $("#chart-symbols").addEventListener("click", (e) => { const b = e.target.closes
 $("#chart-date").addEventListener("change", (e) => { state.chartDate = e.target.value || null; chartKey = ""; loadCharts(); });
 $("#chart-ext").addEventListener("change", () => { chartKey = ""; loadCharts(); });
 $("#chart-days").addEventListener("change", (e) => { state.chartDays = Number(e.target.value); state.chartTf = autoTf(state.chartDays); chartKey = ""; loadCharts(); });
+$("#chart-bench").addEventListener("change", (e) => {
+  if (!state.chartSymbol) return;
+  if (e.target.value === "auto") delete benchChoices[state.chartSymbol]; else benchChoices[state.chartSymbol] = e.target.value;
+  try { localStorage.setItem("mlpt-bench", JSON.stringify(benchChoices)); } catch (_) { /* private mode */ }
+  chartKey = ""; loadCharts();
+});
 $("#chart-tf").addEventListener("change", (e) => { state.chartTf = Number(e.target.value); chartKey = ""; loadCharts(); });
 
 // ----------------------------------------------------------------- daily list
@@ -472,6 +516,9 @@ const SETTINGS = [
     ["macd_min_depth_pct", "עומק מינימלי של ה-MACD מתחת לאפס", "number", "באחוזים ממחיר המניה, נמדד בשפל הירידה של היום. 0 = כל חיתוך מתחת לאפס"],
     ["use_extended_bars", "לכלול נרות מסחר מורחב בחישוב", "checkbox", "כמו גרף עם Extended Hours ב-TradingView"],
   ]],
+  ["גרפים", [
+    ["benchmarks", "מדדים להשוואה בגרף", "text", "תעודות סל שנאספות יחד עם מניות הרשימה: SPY = S&P 500, ‏QQQ = Nasdaq 100, ‏DIA = Dow Jones, ‏IWM = Russell 2000. ריק = בלי מדד"],
+  ]],
   ["אסטרטגיות חלופיות (ma_cross / ma_trend)", [
     ["ma_type", "סוג ממוצע נע", "select:EMA,SMA", ""],
     ["ma_fast", "ממוצע מהיר (נרות דקה)", "number", ""],
@@ -490,6 +537,7 @@ async function loadSettings(force) {
       const options = type === "select" ? r.strategies : type.split(":")[1].split(",");
       input = `<select name="${key}">${options.map((o) => `<option ${o === v ? "selected" : ""}>${esc(o)}</option>`).join("")}</select>`;
     } else if (type === "hhmm") input = `<input type="text" name="${key}" value="${esc(v)}" placeholder="HH:MM" pattern="[0-2][0-9]:[0-5][0-9]" maxlength="5">`;
+    else if (type === "text") input = `<input type="text" name="${key}" value="${esc(v)}" maxlength="60">`;
     else input = `<input type="number" name="${key}" value="${esc(v)}" step="any" min="0">`;
     return `<div class="field"><label for="${key}">${label}</label>${input}${hint ? `<small>${hint}</small>` : ""}</div>`;
   }).join("") + "</fieldset>").join("");

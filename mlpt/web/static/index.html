@@ -71,6 +71,9 @@
             <option value="30">30 דק׳</option><option value="60">שעה</option>
           </select>
         </label>
+        <label title="קו השוואה למדד, מותאם למחיר המניה בתחילת התצוגה">מדד
+          <select id="chart-bench"><option value="auto">אוטומטי</option><option value="none">ללא</option></select>
+        </label>
         <div id="chart-symbols" class="chips"></div>
         <label class="check"><input type="checkbox" id="chart-ext" checked> מסחר מורחב (לפני/אחרי)</label>
         <button id="chart-reset" class="btn small ghost" title="התאמת הצירים לכל הנרות שבטווח">התאם תצוגה</button>
@@ -93,6 +96,7 @@
         <span><i class="key line slow"></i> <span id="key-slow">ממוצע איטי</span></span>
         <span><i class="key line fast"></i> MACD</span>
         <span><i class="key line slow"></i> Signal</span>
+        <span id="key-bench-wrap" hidden><i class="key line bench"></i> <span id="key-bench"></span></span>
         <span>▲ קנייה · ▼ מכירה</span>
         <span>קווים מקווקווים: כניסה / TP / SL של פוזיציה פתוחה</span>
         <span class="muted">הזמנים בשעון ניו יורק</span>

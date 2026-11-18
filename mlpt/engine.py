@@ -78,6 +78,7 @@ class Engine:
         self.last: dict[str, float] = {}           # last traded price per symbol
         self.subscribed: set[str] = set()
         self._once_at: dict[str, float] = {}
+        self._bench_cache: dict[str, tuple[float, dict[str, Any]]] = {}
         self._evaluated: dict[str, int] = {}       # ts of the last bar the strategy has seen, per symbol
         self._mismatch_since: dict[int, float] = {}
         self._sell_notices: list[tuple[float, int]] = []
@@ -753,6 +754,8 @@ class Engine:
     def _sync_subscriptions(self, today_s: str) -> None:
         wanted = {it["symbol"] for it in self.store.watch_for_date(today_s)}
         wanted |= {p["symbol"] for p in self.store.pos_in_states(OPEN_STATES)}
+        if wanted:
+            wanted |= set(self.settings.benchmark_list())      # the indexes the charts compare against
         for sym in sorted(wanted - self.subscribed):
             self._load_series(sym)
             self.subscribed.add(sym)
@@ -1057,7 +1060,57 @@ class Engine:
                 c.high, c.low, c.close, c.volume = max(c.high, b.high), min(c.low, b.low), b.close, c.volume + b.volume
         return out
 
-    def chart(self, symbol: str, trade_date: str, days: int = 1, tf: int = 1) -> dict[str, Any]:
+    BENCHMARK_NAMES = {"SPY": "S&P 500", "QQQ": "Nasdaq 100", "DIA": "Dow Jones", "IWM": "Russell 2000"}
+    BENCHMARK_DAYS = 5          # trading days of history behind the correlation
+    BENCHMARK_MIN_POINTS = 40
+
+    def _returns(self, symbol: str, start: int, end: int) -> dict[int, float]:
+        """Five-minute returns in regular hours, keyed by candle start (no return across the night)."""
+        out: dict[int, float] = {}
+        prev: Optional[Bar] = None
+        for c in self._aggregate([b for b in self.store.bars(symbol, start, end) if b.rth], 5):
+            if prev is not None and c.ts - prev.ts <= 3600 and prev.close:
+                out[c.ts] = c.close / prev.close - 1
+            prev = c
+        return out
+
+    def benchmark_for(self, symbol: str, day: dt.date) -> dict[str, Any]:
+        """The index the stock has moved with most closely over the last trading days up to ``day``."""
+        key = f"{symbol}|{day}|{self.settings.benchmarks}"
+        hit = self._bench_cache.get(key)
+        if hit is not None and self.now() - hit[0] < 600:
+            return hit[1]
+        first = day
+        for _ in range(self.BENCHMARK_DAYS - 1):
+            first -= dt.timedelta(days=1)
+            while not self.calendar.is_trading_day(first):
+                first -= dt.timedelta(days=1)
+        start = int(dt.datetime.combine(first, dt.time(0), tzinfo=ET).timestamp())
+        end = int(dt.datetime.combine(day + dt.timedelta(days=1), dt.time(0), tzinfo=ET).timestamp())
+        mine = self._returns(symbol, start, end)
+        candidates = []
+        for b in self.settings.benchmark_list():
+            if b == symbol:
+                continue
+            theirs = self._returns(b, start, end)
+            common = sorted(set(mine) & set(theirs))
+            corr = None
+            if len(common) >= self.BENCHMARK_MIN_POINTS:
+                x, y = [mine[t] for t in common], [theirs[t] for t in common]
+                mx, my = sum(x) / len(x), sum(y) / len(y)
+                sx = sum((v - mx) ** 2 for v in x) ** 0.5
+                sy = sum((v - my) ** 2 for v in y) ** 0.5
+                if sx > 0 and sy > 0:
+                    corr = round(sum((a - mx) * (c - my) for a, c in zip(x, y)) / (sx * sy), 3)
+            candidates.append({"symbol": b, "name": self.BENCHMARK_NAMES.get(b, b), "corr": corr,
+                               "points": len(common)})
+        ranked = sorted((c for c in candidates if c["corr"] is not None), key=lambda c: -c["corr"])
+        best = ranked[0]["symbol"] if ranked else (candidates[0]["symbol"] if candidates else None)
+        result = {"symbol": best, "by_correlation": bool(ranked), "candidates": candidates}
+        self._bench_cache[key] = (self.now(), result)
+        return result
+
+    def chart(self, symbol: str, trade_date: str, days: int = 1, tf: int = 1, bench: str = "auto") -> dict[str, Any]:
         """Candles, moving averages, MACD and trade markers of one stock.
 
         ``days`` trading days ending at ``trade_date``, in ``tf``-minute candles
@@ -1140,4 +1193,25 @@ class Engine:
             "indicator_bars": sum(1 for b in src if b.ts >= start),
             "uses_extended": st.use_extended_bars,
             "markers": sorted(markers, key=lambda m: m["time"]), "levels": levels,
+            "benchmark": self._chart_benchmark(symbol, day, start, end, tf, bench, shift),
         }
+
+    def _chart_benchmark(self, symbol: str, day: dt.date, start: int, end: int, tf: int, bench: str,
+                         shift: Callable[[int], int]) -> Optional[dict[str, Any]]:
+        """Closing prices of the comparison index for the charted range (the page rebases them)."""
+        marks = self.settings.benchmark_list()
+        if bench == "none" or not marks or symbol in marks:
+            return None
+        auto = self.benchmark_for(symbol, day)
+        chosen = bench.upper() if bench.upper() in marks else auto["symbol"]
+        if chosen is None:
+            return None
+        minute = self.store.bars(chosen, start, end)
+        live = self.live.get(chosen)
+        if live is not None and start <= live.ts < end and (not minute or live.ts > minute[-1].ts):
+            minute = minute + [live]
+        corr = next((c["corr"] for c in auto["candidates"] if c["symbol"] == chosen), None)
+        return {"symbol": chosen, "name": self.BENCHMARK_NAMES.get(chosen, chosen),
+                "auto": bench.upper() not in marks, "by_correlation": auto["by_correlation"], "corr": corr,
+                "candidates": auto["candidates"],
+                "points": [{"time": shift(b.ts), "value": b.close} for b in self._aggregate(minute, tf)]}

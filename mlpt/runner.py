@@ -25,6 +25,9 @@ DEMO_SYMBOLS = {"AAPL": 228.0, "MSFT": 512.0, "NVDA": 141.0, "AMZN": 214.0, "MET
                 "GOOGL": 187.0, "TSLA": 342.0, "AMD": 158.0, "NFLX": 97.0, "AVGO": 262.0}
 
 
+DEMO_INDEXES = {"SPY": 683.0, "QQQ": 612.0, "DIA": 471.0, "IWM": 243.0}
+
+
 def setup_logging(cfg: Config, quiet: bool = False) -> None:
     logs = Path(cfg.data_dir) / "logs"
     logs.mkdir(parents=True, exist_ok=True)
@@ -114,7 +117,7 @@ def _fresh_sim_store(cfg: Config) -> Store:
 def demo_steps(calendar: MarketCalendar, engine: Engine, sim: SimBroker, first: dt.date,
                days: int, seed: int) -> Iterator[Step]:
     rng = random.Random(seed)
-    prices = dict(DEMO_SYMBOLS)
+    prices = {**DEMO_SYMBOLS, **DEMO_INDEXES}
     # one synthetic day of history so the moving averages are warm at the open
     prev = first - dt.timedelta(days=1)
     while not calendar.is_trading_day(prev):
@@ -124,7 +127,7 @@ def demo_steps(calendar: MarketCalendar, engine: Engine, sim: SimBroker, first: 
             sim.history.setdefault(sym, []).append(bar)
     day, n = first, 0
     while days <= 0 or n < days:
-        symbols = rng.sample(sorted(prices), 6)
+        symbols = rng.sample(sorted(DEMO_SYMBOLS), 6)
         engine.load_watchlist(day.isoformat(), "symbol\n" + "\n".join(symbols))
         yield from synthetic_day(calendar, day, prices, rng)
         day, n = calendar.next_trading_day(day), n + 1
@@ -380,6 +383,8 @@ async def run_download(cfg: Config, symbols: list[str], first: dt.date, last: dt
     if not symbols or not days:
         print("nothing to download: give --symbols, or load daily lists for these dates first")
         return 1
+    # the comparison indexes of the charts come along
+    symbols = list(dict.fromkeys(symbols + store.load_settings().benchmark_list()))
     cfg.ib.client_id += 1                # do not collide with a running trading process
     broker = IBBroker(cfg.ib, cfg.mode, calendar)
     broker.on_error = lambda msg, sym=None: print(f"  ! {sym or ''} {msg}")

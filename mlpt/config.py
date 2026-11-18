@@ -139,6 +139,13 @@ class Settings:
     ma_slow: int = 20
     use_extended_bars: bool = False   # feed pre/post-market bars to the strategy
 
+    # index ETFs collected next to the listed stocks and drawn on the charts for comparison
+    # (SPY = S&P 500, QQQ = Nasdaq 100, DIA = Dow Jones, IWM = Russell 2000); empty = none
+    benchmarks: str = "SPY,QQQ,DIA,IWM"
+
+    def benchmark_list(self) -> list[str]:
+        return list(dict.fromkeys(s.strip().upper() for s in self.benchmarks.split(",") if s.strip()))
+
     def validate(self) -> None:
         def pos(name: str, allow_zero: bool = False) -> None:
             v = getattr(self, name)
@@ -164,6 +171,9 @@ class Settings:
             raise ValueError("ma_fast must be smaller than ma_slow")
         if self.macd_fast >= self.macd_slow:
             raise ValueError("macd_fast must be smaller than macd_slow")
+        marks = self.benchmark_list()
+        if len(marks) > 6 or any(not m.replace(".", "").isalnum() or len(m) > 6 for m in marks):
+            raise ValueError("benchmarks: up to 6 comma separated symbols, e.g. SPY,QQQ,DIA,IWM")
         if self.ma_type not in ("EMA", "SMA"):
             raise ValueError("ma_type must be EMA or SMA")
         from .strategy import STRATEGIES  # local import: avoid a cycle

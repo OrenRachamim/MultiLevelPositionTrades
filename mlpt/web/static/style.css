@@ -176,6 +176,7 @@ table.doc { width: auto; margin-top: 6px; }
 .key.line { width: 18px; height: 0; border: 0; border-top: 2px solid; }
 .key.fast { border-color: var(--ma-fast); }
 .key.slow { border-color: var(--ma-slow); }
+.key.bench { border-top: 2px dashed var(--series-7); }
 
 /* back-test */
 #bt-log { max-height: 220px; overflow: auto; margin: 8px 0 0; padding: 8px 10px; font: 12px/1.45 Consolas, "Courier New", monospace;
